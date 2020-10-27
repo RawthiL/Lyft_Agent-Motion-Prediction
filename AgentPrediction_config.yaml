@@ -1,0 +1,138 @@
+# Config format schema number
+format_version: 4
+
+###################
+## Model options
+model_params:
+
+  # Base model for image feature extraction
+  base_image_model: "InceptionV3"
+#   base_image_model: "ResNet50"
+  
+  # Type of recurrent units used in the ego path encoding layer (GRU, LSTM, etc)
+  history_encoder_recurrent_unit: "GRU"
+  # Number of recurrent units used in the ego path encoding layer
+  history_encoder_recurrent_units_number: 64
+  # Number of dense layers to process history coordinates
+  num_hist_encode_layers: 2
+  # Units per dense layer to process history coordinates
+  hist_encode_units: [8, 16]
+  # Activation of dense layers to process history coordinates
+  hist_encode_activation: 'relu'
+  # Type of recurrent units used in the ego path decoding layer (GRU, LSTM, etc)
+  path_generation_decoder_recurrent_unit: "GRU"
+  # Number of recurrent units used in the ego path decoding layer
+  path_generation_decoder_recurrent_units_number: 128
+  # Size of the intermediate space used in the attention mechanism
+  pathDec_attention_pr_units: 256
+  # Number of fully connected layers used to generate the output coordinates (not counting last)
+  num_path_decode_fc_layers: 1
+  # Number of units in the FC layers used to generate the output coordinates
+  path_decode_fc_units: [16]
+  # Activation of the FC layers used to generate the output coordinates
+  path_decode_fc_activation: 'relu'
+   
+  history_num_frames: 10
+  history_step_size: 1
+  history_delta_time: 0.1
+
+  future_num_frames: 50
+  future_step_size: 1
+  future_delta_time: 0.1
+  
+###################
+## Training options
+training_params: 
+
+  # Learning rate of the path generator network
+#   generator_learning_rate: 0.001
+  # LEarning rate list and epochsm conforming a learning rate schuedule
+  gen_lr_list: [0.001, 0.0001, 0.00005, 0.00001]
+  gen_lr_lims: [   10,     30,      60,     100]
+  # Number of scenes to be used in training
+  number_of_scenes: 16000
+  # Whether or not pick the scenes at random
+  randomize_scenes: True
+  # Frames to be read from a given scene
+  frames_per_scene: 1
+  # Whether or not pick the frames inside a given scene at random
+  randomize_frames: True
+  # Epochs to train, an epoch is a complete iteration over the "number_of_scenes", 
+  # computing "frames_per_scene"x"number_of_scenes" samples.
+  epochs_train: 100
+  # Whether or not use teacher forcing during train
+  use_teacher_force: True
+  # The decay rate of the teacher force.
+  # If set to 0 the teacher force will behave normally (next path is the target path)
+  # If set to >0, the teacher force will be a linear interpolation of the target path 
+  # and the generated path. 
+  teacher_force_decay: 0.025 # 0.75
+  # Teacher force list and limits conforming a teacher force modulation schedule
+  teacher_force_list: [1.0, 0.75, 0.5, 0.25, 0.0]
+  teacher_force_lims: [  5,   10,  20,   30, 100]
+  # Whether or not initialize the decoder recurrent layer using the history paths
+  init_decoder_on_history: True
+  
+  # Whether or not retrain input layer of image processing model
+  retrain_inputs_image_model: False
+  
+  
+  
+
+###################
+## Input raster parameters
+raster_params:
+  # raster image size [pixels]
+  raster_size:
+    - 224
+    - 224
+  # raster's spatial resolution [meters per pixel]: the size in the real world one pixel corresponds to.
+  pixel_size:
+    - 0.5
+    - 0.5
+  # From 0 to 1 per axis, [0.5,0.5] would show the ego centered in the image.
+  ego_center:
+    - 0.25
+    - 0.5
+  map_type: "py_semantic"
+#   map_type: "py_satellite"
+
+
+  # the keys are relative to the dataset environment variable
+  satellite_map_key: "aerial_map/aerial_map.png"
+  semantic_map_key: "semantic_map/semantic_map.pb"
+  dataset_meta_key: "meta.json"
+
+  # e.g. 0.0 include every obstacle, 0.5 show those obstacles with >0.5 probability of being
+  # one of the classes we care about (cars, bikes, peds, etc.), >=1.0 filter all other agents.
+  filter_agents_threshold: 0.5
+
+  # whether to completely disable traffic light faces in the semantic rasterizer
+  disable_traffic_light_faces: False
+
+###################
+## Data loader options
+sample_data_loader:
+  key: "scenes/sample.zarr"
+  batch_size: 64
+  shuffle: False
+  num_workers: 16
+
+train_data_loader:
+  key: "scenes/train.zarr"
+  batch_size: 16
+  shuffle: True
+  num_workers: 4
+
+val_data_loader:
+  key: "scenes/validate.zarr"
+  batch_size: 16
+  shuffle: False
+  num_workers: 4
+  
+test_data_loader:
+  key: "scenes/test.zarr"
+  batch_size: 1
+  shuffle: False
+  num_workers: 4
+
