@@ -18,7 +18,7 @@ import tensorflow.keras.backend as K
 ###############################################################################
 
 @tf.function
-def model_forward_pass(img_t, hist_t, stepsInfer, ImageEncModel, HistEncModel, PathDecModel,
+def model_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, HistEncModel, PathDecModel,
                        thisHiddenState = None,
                        use_teacher_force = False, 
                        teacher_force_weight = tf.constant(1.0), 
@@ -33,13 +33,14 @@ def model_forward_pass(img_t, hist_t, stepsInfer, ImageEncModel, HistEncModel, P
     Arguments:
     img_t --- Multi-channel map input tensor.
     hist_t --- Path history tensor.
+    histAvail --- History availability tensor.
     stepsInfer --- Number of steps to infer.
     ImageEncModel --- Model used to encode the input image (img_t)
     HistEncModel --- Model used to encode the input history (hist_t)
     PathDecModel --- Model used to produce the requested predictions.
     thisHiddenState --- Initial hidden state of the decoder model.
     use_teacher_force --- Use a linear interpolation of the target path and the last predicted path.
-    teacher_force_weight --- Fraction of the target path used in the linear interpolation between target and predicte.
+    teacher_force_weight --- Fraction of the target path used in the linear interpolation between target and predicted.
     target_path --- Target path (used if use_teacher_force==True)
     stop_gradient_on_prediction --- Prevent gradient to be calculated through the recursive net.
     
@@ -54,6 +55,7 @@ def model_forward_pass(img_t, hist_t, stepsInfer, ImageEncModel, HistEncModel, P
     
     # Number of history states
     stepsHist = hist_t.shape[1]
+    #stepsHist = tf.reduce_sum(histAvail, axis=-1)
     
     if thisHiddenState == None:
         thisHiddenState = tf.zeros(PathDecModel.inputs[-1].shape)
@@ -118,7 +120,7 @@ def pathDecoderModel(cfg, ImageEncModel, HistEncModel):
     Creates a Keras model for Agent path prediction based on a given recurrent unit.
     
     This model takes as input the code tensors from the encoding models and outputs 
-    a predicted path. This models implemets attention on the image code tensor.
+    a predicted path. This models implements attention on the image code tensor.
     
     Arguments:
     cfg --- Configuration.
@@ -182,7 +184,7 @@ def pathDecoderModel(cfg, ImageEncModel, HistEncModel):
     try:
         pathDec_base_recurrent_unit = getattr(keras.layers, pathDec_recurrent_unit)
     except:
-        raise Exception('Path decoder base recurrent unit not found. Reuquested unit: %s'%pathDec_recurrent_unit)
+        raise Exception('Path decoder base recurrent unit not found. Requested unit: %s'%pathDec_recurrent_unit)
 
     # Apply recurrent output
     featT = K.expand_dims(featT, 1)
@@ -247,7 +249,7 @@ def pathEncodingModel(cfg):
     try:
         histEnc_base_recurrent_unit = getattr(keras.layers, histEnc_recurrent_unit)
     except:
-        raise Exception('History encoder base recurrent unit not found. Reuquested unit: %s'%histEnc_recurrent_unit)
+        raise Exception('History encoder base recurrent unit not found. Requested unit: %s'%histEnc_recurrent_unit)
    
     # Recurrent encoding
     outs  = histEnc_base_recurrent_unit(histEnc_recurrent_unit_num,
@@ -343,7 +345,7 @@ def imageEncodingModel(base_img_model, cfg):
         if idx_layer <= idx_layer_start:
             continue 
 
-        # Get name of predecesor layers
+        # Get name of predecessor layers
         int_node = this_layer._inbound_nodes[0]
         if type(int_node.inbound_layers) is list:
             prev_layers_names = [auxLayer.name for auxLayer in int_node.inbound_layers]
@@ -355,7 +357,7 @@ def imageEncodingModel(base_img_model, cfg):
         # Get layer configuration
         this_config = this_layer.get_config()
         this_weights = this_layer.get_weights()
-        # Freeze the layer whieghts
+        # Freeze the layer weights
         this_config['trainable'] = False
         # Duplicate layer
         append_layer = this_layer.from_config(this_config)

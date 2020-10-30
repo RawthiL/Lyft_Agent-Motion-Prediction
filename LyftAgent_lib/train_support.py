@@ -6,11 +6,17 @@ import os, sys
 import numpy as np
 from tqdm import tqdm
 
+sys.path.insert(0, os.path.split(os.path.realpath(__file__))[0])
 import topologies as lyl_nn
 
 import tensorflow as tf
 import tensorflow.keras as keras
 import tensorflow.keras.backend as K
+
+from l5kit.evaluation import metrics
+
+
+
 
 
 ###############################################################################
@@ -23,6 +29,7 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
                          optimizer_gen, 
                          gen_loss,
                          initial_hidden_state,
+                         stepsInfer = None,
                          use_teacher_force=True, 
                          teacher_force_weight = tf.constant(1.0, dtype=tf.float32)):
     
@@ -42,27 +49,25 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
     gen_loss --- Keras metric object.
     initial_hidden_state --- Initial hidden state of the decoder model.
     use_teacher_force --- Use a linear interpolation of the target path and the last predicted path.
-    teacher_force_weight --- Fraction of the target path used in the linear interpolation between target and predicte.
+    teacher_force_weight --- Fraction of the target path used in the linear interpolation between target and predicted.
     '''
     
     # Get number of steps to generate
-    stepsInfer = target_path.shape[1]
+    if stepsInfer == None:
+        stepsInfer = target_path.shape[1]
     
     # Start gradient tape
     with tf.GradientTape() as gen_tape:
-        
-        # Set initial hidden state
-        thisHiddenState = initial_hidden_state
-        
+              
         # Get predicted paths
-        thisPath = lyl_nn.model_forward_pass(img_t, hist_t, stepsInfer, 
+        thisPath = lyl_nn.model_forward_pass(img_t, hist_t, HistAvail, stepsInfer, 
                                       ImageEncModel, HistEncModel, PathDecModel,
                                       thisHiddenState = initial_hidden_state, 
                                       use_teacher_force = use_teacher_force, 
                                       teacher_force_weight = teacher_force_weight,
                                       target_path = target_path)      
         # Compute predicted path loss
-        gen_L2_loss = calc_loss(thisPath,target_path, TargetAvail)
+        gen_L2_loss = calc_loss(thisPath,target_path[:,:stepsInfer,:], TargetAvail[:,:stepsInfer])
         
     # Get list of trainable variables
     train_vars = ImageEncModel.trainable_variables+ \
@@ -152,6 +157,9 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
     idx_val = 0
     print_gen_L2_val = 0
     valLoss_acum = 0 
+
+    valLikelihood_acum = 0
+    valTime_displace_acum = 0
         
     val_dataset_prog_bar = tqdm(tf_validation_dataset, total=steps_validate)
     for (valSampleMapComp, valSampeHistPath, valSampeTargetPath, 
@@ -162,10 +170,11 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
         PathDecModel.reset_states()
         HistEncModel.reset_states()
         valPredPath = lyl_nn.model_forward_pass(valSampleMapComp,
-                                         valSampeHistPath,
-                                         valSampeTargetPath.shape[-2], 
-                                         ImageEncModel, HistEncModel, PathDecModel,
-                                         use_teacher_force=False)
+                                                valSampeHistPath,
+                                                valHistAvail,
+                                                valSampeTargetPath.shape[-2], 
+                                                ImageEncModel, HistEncModel, PathDecModel,
+                                                use_teacher_force=False)
 
         valPredPath = valPredPath.numpy()
         # Calculate loss
@@ -181,11 +190,25 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
         msg_string = 'Validation: L2 Loss: %.2f (last %.2f) '%(print_gen_L2_val, valLoss)
         val_dataset_prog_bar.set_description(msg_string)
 
+        # # Process lyft metrics
+        # for idx_batch in range(valPredPath.shape[0]):
+        #     valLikelihood_acum += metrics.neg_multi_log_likelihood(np.expand_dims(valSampeTargetPath[idx_batch,:,:2], axis=0), 
+        #                                                             np.expand_dims(valPredPath[idx_batch,:,:2], axis=0), 
+        #                                                             np.expand_dims(np.ones((1)), axis=0), 
+        #                                                             np.expand_dims(valTargetAvail[idx_batch,:], axis=0), 
+
+        #     valTime_displace_acum += metrics.time_displace(np.expand_dims(valSampeTargetPath[idx_batch,:,:2], axis=0), 
+        #                                                             np.expand_dims(valPredPath[idx_batch,:,:2], axis=0), 
+        #                                                             np.expand_dims(np.ones((1)), axis=0), 
+        #                                                             np.expand_dims(valTargetAvail[idx_batch,:], axis=0), 
+                                                                                                                            
+
         idx_val += 1
-        if idx_val > steps_validate:
-            break
+        if steps_validate != None:
+            if idx_val > steps_validate:
+                break
             
-    return valLoss_acum/idx_val
+    return valLoss_acum/idx_val #, valLikelihood_acum/idx_val, valTime_displace_acum/idx_val
 
 
 
@@ -379,8 +402,8 @@ def tf_get_input_sample(datasetSample):
         
     Outputs:
     sampleMapComp --- Multi-channel image with the RGB map and the faded Ego and Agents
-    sampeHistPath --- Tensor of history [num_hist_frames x coordinates]
-    sampeTargetPath --- Target tensor [num_objective_frames x coordinates]
+    sampleHistPath --- Tensor of history [num_hist_frames x coordinates]
+    sampleTargetPath --- Target tensor [num_objective_frames x coordinates]
     histAvail --- Bool tensor of history availability [num_hist_frames]
     targetAvail --- Bool tensor of target availability [num_objective_frames]
     timeStamp --- Time stamp of the sample
@@ -418,7 +441,7 @@ def tf_get_input_sample(datasetSample):
     y = datasetSample['history_positions'][:,1]#/40.0
     y = tf.expand_dims(y, axis=-1)
     a = datasetSample['history_yaws']#/np.pi
-    sampeHistPath = tf.concat([x, y, a], axis = -1)   
+    sampleHistPath = tf.concat([x, y, a], axis = -1)   
     
     
     # Targets
@@ -427,7 +450,7 @@ def tf_get_input_sample(datasetSample):
     y = datasetSample['target_positions'][:,1]#/40.0
     y = tf.expand_dims(y, axis=-1)
     a = datasetSample['target_yaws']#/np.pi
-    sampeTargetPath = tf.concat([x, y, a], axis = -1)  
+    sampleTargetPath = tf.concat([x, y, a], axis = -1)  
     
     # Availability
     histAvail = datasetSample['history_availabilities']
@@ -435,15 +458,15 @@ def tf_get_input_sample(datasetSample):
 #     histAvail = datasetSample['history_availabilities']
 #     targetAvail = datasetSample['target_yaws']!=0.0
 #     targetAvail = tf.squeeze(targetAvail)
-#     targetAvail_mask = tf.cast(tf.concat([[1],tf.zeros(targetAvail.shape[0]-1)], axis=0), dtype=tf.bool) # Force at least one sample to true (this fails, and I dont trust the dataset availability...)
-#     targetAvail = tf.cast(tf.logical_or(targetAvail, targetAvail_mask), dtype=np.float32)
+    # targetAvail_mask = tf.cast(tf.concat([[1],tf.zeros(targetAvail.shape[0]-1)], axis=0), dtype=tf.bool) # Force at least one sample to true (this fails, and I dont trust the dataset availability...)
+    # targetAvail = tf.cast(tf.logical_or(targetAvail, targetAvail_mask), dtype=np.float32)
 
     # Data
     timeStamp = datasetSample['timestamp']
     trackID = datasetSample['track_id']
     thisRasterFromAgent = datasetSample["raster_from_agent"]
-    
-    return sampleMapComp, sampeHistPath, sampeTargetPath, histAvail, targetAvail, timeStamp, trackID, thisRasterFromAgent
+
+    return sampleMapComp, sampleHistPath, sampleTargetPath, histAvail, targetAvail, timeStamp, trackID, thisRasterFromAgent
 
     
     
@@ -451,6 +474,7 @@ def tf_get_input_sample(datasetSample):
 ###############################################################################
 # ------------------------ TF MODEL LOAD/SAVE ------------------------------- #
 ###############################################################################
+
 
 def save_model(model_save, save_path, save_name, use_keras=True):
     """
