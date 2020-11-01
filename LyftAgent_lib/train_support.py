@@ -29,6 +29,7 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
                          optimizer_gen, 
                          gen_loss,
                          initial_hidden_state,
+                         forwardpass_use,
                          stepsInfer = None,
                          use_teacher_force=True, 
                          teacher_force_weight = tf.constant(1.0, dtype=tf.float32)):
@@ -60,7 +61,7 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
     with tf.GradientTape() as gen_tape:
               
         # Get predicted paths
-        thisPath = lyl_nn.model_forward_pass(img_t, hist_t, HistAvail, stepsInfer, 
+        thisPath = forwardpass_use(img_t, hist_t, HistAvail, stepsInfer, 
                                       ImageEncModel, HistEncModel, PathDecModel,
                                       thisHiddenState = initial_hidden_state, 
                                       use_teacher_force = use_teacher_force, 
@@ -86,7 +87,7 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
 
 def get_teacher_force_weight(tf_list, tf_lims, epoch, tf_weight_act, linearize=False):
     '''
-    Set the teacher force weight given the epoch and the weight planning.
+    Get the teacher force weight given the epoch and the weight planning.
     
     Arguments:
     tf_list --- List of teacher force weights.
@@ -96,7 +97,7 @@ def get_teacher_force_weight(tf_list, tf_lims, epoch, tf_weight_act, linearize=F
     linearize --- Linearize the teacher force weight between the given points.
         
     Outputs:
-    tf_weight_new --- Neq teacher force weight.
+    tf_weight_new --- New teacher force weight.
     '''
     
     # Get current weight
@@ -134,11 +135,38 @@ def update_lr(lr_list, lr_lims, epoch, optimizer):
         
     return
 
+
+def get_future_steps_train(fs_list, fs_lims, epoch, fs_act):
+    '''
+    Get the number of future steps to train on given the epoch and the planning.
+    
+    Arguments:
+    fs_list --- List of future steps.
+    fs_lims --- List of limit epochs.
+    epoch --- Current train epoch.
+    fs_act --- Current future steps weight.
+        
+    Outputs:
+    fs_new --- New future steps to train on.
+    '''
+    
+    # Get current weight
+    fs_lims = np.array(fs_lims)
+    
+    fs_new = fs_list[np.squeeze(np.argwhere(fs_lims>=epoch)[0])]
+            
+    # If the value is new, inform
+    if fs_act != fs_new:
+        print('Training on %d future steps.'%fs_new)
+    
+    return fs_new
+
+
 ###############################################################################
 # ------------------------ VALIDATION FUNCTIONS ----------------------------- #
 ###############################################################################
 
-def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecModel, 
+def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecModel, forwardpass_use,
                    steps_validate = None):
     '''
     Validate the generator model using the validation dataset.
@@ -169,7 +197,7 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
         # Predict
         PathDecModel.reset_states()
         HistEncModel.reset_states()
-        valPredPath = lyl_nn.model_forward_pass(valSampleMapComp,
+        valPredPath = forwardpass_use(valSampleMapComp,
                                                 valSampeHistPath,
                                                 valHistAvail,
                                                 valSampeTargetPath.shape[-2], 

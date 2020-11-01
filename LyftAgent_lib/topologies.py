@@ -18,14 +18,125 @@ import tensorflow.keras.backend as K
 ###############################################################################
 
 @tf.function
-def model_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, HistEncModel, PathDecModel,
+def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, HistEncModel, PathDecModel,
+                        thisHiddenState = None,
+                       use_teacher_force = False, 
+                       teacher_force_weight = tf.constant(1.0), 
+                       target_path=None,
+                       stop_gradient_on_prediction = False):
+    '''
+    Forward pass of the path decoding model V2.
+    
+    This function applies all models to get features and the number of requested
+    predictions.
+
+    Unlike model V1, this model uses the HistEncModel only for coding the history and then
+    is not updated with predicted positions. The output sequence of the HistEncModel is
+    used with the attention mechanism of the PathDecMode. 
+    Predicted positions are re-used by the PathDecModel concatenated to the image and history
+    feature tensors. 
+    The initial state of the PathDecModel is obtained from the last state of the HistEncModel.
+    
+    Arguments:
+    img_t --- Multi-channel map input tensor.
+    hist_t --- Path history tensor.
+    histAvail --- History availability tensor.
+    stepsInfer --- Number of steps to infer.
+    ImageEncModel --- Model used to encode the input image (img_t)
+    HistEncModel --- Model used to encode the input history (hist_t)
+    PathDecModel --- Model used to produce the requested predictions.
+    thisHiddenState --- Not used, only for compat.
+    use_teacher_force --- Use a linear interpolation of the target path and the last predicted path.
+    teacher_force_weight --- Fraction of the target path used in the linear interpolation between target and predicted.
+    target_path --- Target path (used if use_teacher_force==True)
+    stop_gradient_on_prediction --- Prevent gradient to be calculated through the recursive net.
+    
+        
+    Outputs:
+    out_list --- Predicted path points.
+    '''
+                       
+    # Reset the hidden states for this batch # BUGGED INSIDE @tf.function??
+    HistEncModel.reset_states()
+    
+    # Number of history states
+    stepsHist = hist_t.shape[1]
+    #stepsHist = tf.reduce_sum(histAvail, axis=-1)
+    
+
+    # Process input image
+    img_feats = ImageEncModel(img_t)  
+
+    # Process history
+    hist_out_list = list()
+    hist_hidden_list = list()
+    for idx_step_hist in range(stepsHist):
+        hist_outs, hist_states = HistEncModel(tf.expand_dims(hist_t[:,stepsHist-1-idx_step_hist,:], 1))
+        hist_out_list.append(hist_outs)
+        hist_hidden_list.append(hist_states)
+
+    # Convert results list to tensor
+    hist_outs = tf.convert_to_tensor(hist_out_list)
+    hist_states = tf.convert_to_tensor(hist_hidden_list)
+    # Transpose match dimension order
+    hist_outs = tf.transpose(hist_outs, (1,0,2))
+    hist_states = tf.squeeze(hist_states)
+    hist_states = tf.transpose(hist_states, (1,0,2))
+        
+    # Reset decoder model states to last state of HistEncModel
+    thisHiddenState = tf.squeeze(hist_states[:,-1,:])
+    # PathDecModel.reset_states(states = thisHiddenState) # Not implemented for model (tf 2.3 API)
+    reset_states(PathDecModel, layer_states_dict = {'gru':  thisHiddenState})
+                       
+    # Output List
+    out_list = list()
+
+    # Create requested path points
+    nextPath = tf.squeeze(hist_t[:,0,:]) # Process current step first
+    for idx_step in range(stepsInfer):
+        
+        if stop_gradient_on_prediction:
+            nextPath = tf.stop_gradient(nextPath)
+            
+        # Get predicted step using decoder
+        thisPath, thisHiddenState, _, _ = PathDecModel([nextPath,
+                                                       img_feats, 
+                                                       hist_outs, 
+                                                       hist_states, 
+                                                       thisHiddenState])
+        
+        # Add out step
+        out_list.append(thisPath)
+
+        # Apply teacher forcing
+        if use_teacher_force:
+            # Our teacher force can be modulated using linear interpolation between the 
+            # real and generated path
+            delta_path = (thisPath-target_path[:,idx_step,:])
+            nextPath = target_path[:,idx_step,:] + (1.0-teacher_force_weight)*delta_path
+            
+        else:
+            nextPath = thisPath
+        
+        
+        
+    # Convert results list to tensor
+    out_list = tf.convert_to_tensor(out_list)
+    # Transpose match dimension order
+    out_list = tf.transpose(out_list, (1,0,2))
+    
+    return out_list
+
+
+@tf.function
+def modelV1_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, HistEncModel, PathDecModel,
                        thisHiddenState = None,
                        use_teacher_force = False, 
                        teacher_force_weight = tf.constant(1.0), 
                        target_path=None,
                        stop_gradient_on_prediction = False):
     '''
-    Forward pass of the path decoding model.
+    Forward pass of the path decoding model V1.
     
     This function applies all models to get features and the number of requested
     predictions.
@@ -112,10 +223,98 @@ def model_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hist
 
 
 ###############################################################################
-# ------------------------ PATH PREDICTION DECODING NET --------------------- #
+# ------------------------ PATH PREDICTION DECODING NETS -------------------- #
 ###############################################################################
 
-def pathDecoderModel(cfg, ImageEncModel, HistEncModel):
+
+def pathDecoderModel_V2(cfg, ImageEncModel, HistEncModel):
+    '''
+    Creates a Keras model for Agent path prediction based on a given recurrent unit.
+    
+    This model takes as input the code tensors from the encoding models and outputs 
+    a predicted path. This models implements attention on the image code tensor and
+    on the states of a previous recurrent unit used to encode the history path.
+        
+    Arguments:
+    cfg --- Configuration.
+    ImageEncModel --- Keras image encoding model.
+    HistEncModel --- Keras image encoding model.
+    
+        
+    Outputs:
+    PathDecModel --- Keras path decoding model.
+    '''
+
+    # Get config
+    gen_batch_size             = cfg["train_data_loader"]["batch_size"]
+    histEnc_recurrent_unit_num = cfg["model_params"]["history_encoder_recurrent_units_number"]
+    pathDec_recurrent_unit     = cfg["model_params"]["path_generation_decoder_recurrent_unit"]
+    pathDec_recurrent_unit_num = cfg["model_params"]["path_generation_decoder_recurrent_units_number"]
+    pathDec_attention_pr_units = cfg["model_params"]["pathDec_attention_pr_units"]
+    num_path_decode_fc_layers  = cfg["model_params"]["num_path_decode_fc_layers"]
+    path_decode_fc_units       = cfg["model_params"]["path_decode_fc_units"]
+    path_decode_fc_activation  = cfg["model_params"]["path_decode_fc_activation"]
+
+    imageProcPixelNum          = ImageEncModel.output_shape[1]
+    imageProcFeatNum           = ImageEncModel.output_shape[2]
+    
+    # Inputs
+    Input_Image_Features = keras.Input(batch_shape=(gen_batch_size, imageProcPixelNum, imageProcFeatNum), 
+                                       name="Input_Image_Features")
+    Input_History_Hidden = keras.Input(batch_shape=(gen_batch_size, None, histEnc_recurrent_unit_num), 
+                                         name="Input_History_Hidden")
+    Input_History_Out = keras.Input(batch_shape=(gen_batch_size, None, histEnc_recurrent_unit_num), 
+                                         name="Input_History_Out")
+    Input_Last_Hidden_State = keras.Input(batch_shape=(gen_batch_size, pathDec_recurrent_unit_num), 
+                                         name="Input_Last_Hidden_State")
+    Input_position = keras.Input(batch_shape=(gen_batch_size, 3), name="Input_position")
+
+
+    # Set attention mechanism for image
+    imageAttnFeatT, attenScores_image = BahdanauAttention(pathDec_attention_pr_units)([Input_Last_Hidden_State, Input_Image_Features])
+    # Set attention mechanism for history
+    histAttnFeatT, attenScores_history = BahdanauAttention(pathDec_attention_pr_units)([Input_Last_Hidden_State, Input_History_Out])
+
+
+    # Project the physical attention to a lower space (matching path history encoding)
+    imageAttnFeatT = keras.layers.Dense(histEnc_recurrent_unit_num,
+                                         activation='relu')(imageAttnFeatT)
+
+    # Concatenate feature tensors with current position
+    featT = keras.layers.Concatenate(axis=-1)([imageAttnFeatT, histAttnFeatT, Input_position])
+
+
+    # Get recurrent unit to use
+    try:
+        pathDec_base_recurrent_unit = getattr(keras.layers, pathDec_recurrent_unit)
+    except:
+        raise Exception('Path decoder base recurrent unit not found. Requested unit: %s'%pathDec_recurrent_unit)
+
+    # Apply recurrent output
+    featT = K.expand_dims(featT, 1)
+    featOutT, featHidT  = pathDec_base_recurrent_unit(pathDec_recurrent_unit_num,
+                                                      stateful=True,
+                                                      return_state=True)(featT)
+
+    # Get predicted position
+    for idx_decode_layer in range(num_path_decode_fc_layers):
+        featOutT = keras.layers.Dense(path_decode_fc_units[idx_decode_layer],
+                                      activation = path_decode_fc_activation)(featOutT)
+    # Last output
+    pathOut = keras.layers.Dense(3,
+                                activation = None)(featOutT)
+
+    # Create model
+    return keras.Model([Input_position,
+                        Input_Image_Features,
+                        Input_History_Out, 
+                        Input_History_Hidden, 
+                        Input_Last_Hidden_State],
+                       [pathOut, featHidT, attenScores_image, attenScores_history],
+                       name='Path_Decoder_Model')
+
+
+def pathDecoderModel_V1(cfg, ImageEncModel, HistEncModel):
     '''
     Creates a Keras model for Agent path prediction based on a given recurrent unit.
     
@@ -216,12 +415,14 @@ def pathDecoderModel(cfg, ImageEncModel, HistEncModel):
 # ------------------------ PATH HISTORY ENCODING NET ------------------------ #
 ###############################################################################
 
-def pathEncodingModel(cfg):
+def pathEncodingModel(cfg, return_sequences=False, CarNet = False):
     '''
     Creates a Keras model for Agent history encoding based on a given recurrent unit.
     
     Arguments:
     cfg --- Configuration.
+    return_sequences --- If true the outputs and states for each input step are returned
+    CarNet --- If true, only the dense layers are applied, making the V1 model the same as the CARnet (sadeghian2018car)
         
     Outputs:
     HistEncModel --- Keras path history encoding model.
@@ -245,20 +446,27 @@ def pathEncodingModel(cfg):
         pathFeatT = keras.layers.Dense(hist_encode_units[idx_encode_layer],
                                        activation=hist_encode_activation)(pathFeatT)
 
-    # Get recurrent unit to use
-    try:
-        histEnc_base_recurrent_unit = getattr(keras.layers, histEnc_recurrent_unit)
-    except:
-        raise Exception('History encoder base recurrent unit not found. Requested unit: %s'%histEnc_recurrent_unit)
-   
-    # Recurrent encoding
-    outs  = histEnc_base_recurrent_unit(histEnc_recurrent_unit_num,
-                                        return_state=True,
-                                        stateful=True)(pathFeatT)
+    if not CarNet:
+        # Get recurrent unit to use
+        try:
+            histEnc_base_recurrent_unit = getattr(keras.layers, histEnc_recurrent_unit)
+        except:
+            raise Exception('History encoder base recurrent unit not found. Requested unit: %s'%histEnc_recurrent_unit)
+    
+        # Recurrent encoding
+        outs  = histEnc_base_recurrent_unit(histEnc_recurrent_unit_num,
+                                            return_state=True,
+                                            return_sequences=return_sequences,
+                                            stateful=True)(pathFeatT)
+        # Get output and states
+        encoder_out = outs[0]
+        encoder_states = outs[1:]
+    else:
+        # Return the encoding of the input coordinates
+        encoder_out = pathFeatT
+        encoder_states = pathFeatT
 
-    # Get output and states
-    encoder_out = outs[0]
-    encoder_states = outs[1:]
+    
 
     return keras.Model(Input_hist_frames, [encoder_out, encoder_states], name='History_Encoding_Model')
 
@@ -384,7 +592,7 @@ def imageEncodingModel(base_img_model, cfg):
 
 
 ###############################################################################
-# ------------------------ CUSTOM LAYERS ------------------------------------ #
+# ------------------------ CUSTOM LAYERS AND FUNCTIONS ---------------------- #
 ###############################################################################
 
 # Attention layer from https://www.tensorflow.org/tutorials/text/nmt_with_attention
@@ -429,3 +637,24 @@ class BahdanauAttention(tf.keras.layers.Layer):
             'units': self.units,
         })
         return config
+
+
+    
+def reset_states(model, layer_states_dict = dict()):
+    '''
+    Resets the state of the "statefull" recurrent layers within a model.
+    Optionally sets the states to a given value.
+
+    Arguments:
+    model --- Model to be resetted.
+    layer_states_dict --- Dictionary containing the name and value of each recurrent layer to be initialized.
+    '''
+    for layer in model.layers:
+        if hasattr(layer, 'reset_states') and getattr(layer, 'stateful', False):
+
+            if layer.name in layer_states_dict:
+                layer.reset_states(states = layer_states_dict[layer.name])
+            else:
+                layer.reset_states()
+
+    return
