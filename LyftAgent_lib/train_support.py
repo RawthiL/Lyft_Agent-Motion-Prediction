@@ -167,7 +167,7 @@ def get_future_steps_train(fs_list, fs_lims, epoch, fs_act):
 ###############################################################################
 
 def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecModel, forwardpass_use,
-                   steps_validate = None):
+                   steps_validate = None, all_metrics = False):
     '''
     Validate the generator model using the validation dataset.
     
@@ -183,7 +183,6 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
     '''
     
     idx_val = 0
-    print_gen_L2_val = 0
     valLoss_acum = 0 
 
     valLikelihood_acum = 0
@@ -209,35 +208,46 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
         valLoss = calc_loss(valPredPath, valSampeTargetPath, valTargetAvail)
         valLoss = np.mean(valLoss.numpy())
 
-        # Update info
+        # Update 
         valLoss_acum += valLoss
-        print_gen_L2_val = valLoss_acum/(idx_val+1)
+
+
+        # Process lyft metrics
+        if all_metrics:
+            for idx_batch in range(valPredPath.shape[0]):
+                valLikelihood_acum += metrics.neg_multi_log_likelihood(valSampeTargetPath[idx_batch,:,:2], 
+                                                                        np.expand_dims(valPredPath[idx_batch,:,:2], axis=0), 
+                                                                        np.ones((1)), 
+                                                                        valTargetAvail[idx_batch,:])
+
+                valTime_displace_acum += metrics.time_displace(valSampeTargetPath[idx_batch,:,:2], 
+                                                                        np.expand_dims(valPredPath[idx_batch,:,:2], axis=0), 
+                                                                        np.ones((1)), 
+                                                                        valTargetAvail[idx_batch,:]) 
+
+                                                                             
 
 
         # Update progress bar
-        msg_string = 'Validation: L2 Loss: %.2f (last %.2f) '%(print_gen_L2_val, valLoss)
-        val_dataset_prog_bar.set_description(msg_string)
+        if all_metrics:
+            msg_string = 'Validation: L2 = %.2f ; L = %.2f ; TD(T) = %0.2f '%( (valLoss_acum/(idx_val+1)),
+                                                                            (valLikelihood_acum/(idx_val+1)),
+                                                                            (valTime_displace_acum[-1]/(idx_val+1)))
+            val_dataset_prog_bar.set_description(msg_string)
+        else:
+            msg_string = 'Validation: L2 Loss: %.2f (last %.2f) '%(valLoss_acum/(idx_val+1), valLoss)
+            val_dataset_prog_bar.set_description(msg_string)
 
-        # # Process lyft metrics
-        # for idx_batch in range(valPredPath.shape[0]):
-        #     valLikelihood_acum += metrics.neg_multi_log_likelihood(np.expand_dims(valSampeTargetPath[idx_batch,:,:2], axis=0), 
-        #                                                             np.expand_dims(valPredPath[idx_batch,:,:2], axis=0), 
-        #                                                             np.expand_dims(np.ones((1)), axis=0), 
-        #                                                             np.expand_dims(valTargetAvail[idx_batch,:], axis=0), 
-
-        #     valTime_displace_acum += metrics.time_displace(np.expand_dims(valSampeTargetPath[idx_batch,:,:2], axis=0), 
-        #                                                             np.expand_dims(valPredPath[idx_batch,:,:2], axis=0), 
-        #                                                             np.expand_dims(np.ones((1)), axis=0), 
-        #                                                             np.expand_dims(valTargetAvail[idx_batch,:], axis=0), 
-                                                                                                                            
 
         idx_val += 1
         if steps_validate != None:
             if idx_val > steps_validate:
                 break
-            
-    return valLoss_acum/idx_val #, valLikelihood_acum/idx_val, valTime_displace_acum/idx_val
 
+    if all_metrics:            
+        return valLoss_acum/idx_val, valLikelihood_acum/idx_val, valTime_displace_acum/idx_val
+    else:
+        return valLoss_acum/idx_val
 
 
 ###############################################################################

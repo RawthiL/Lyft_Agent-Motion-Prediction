@@ -168,7 +168,7 @@ def modelV1_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
     stepsHist = hist_t.shape[1]
     #stepsHist = tf.reduce_sum(histAvail, axis=-1)
     
-    if thisHiddenState == None:
+    if not tf.is_tensor(thisHiddenState):
         thisHiddenState = tf.zeros(PathDecModel.inputs[-1].shape)
     
     # Process input image
