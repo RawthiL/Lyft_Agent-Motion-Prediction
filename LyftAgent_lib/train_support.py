@@ -287,6 +287,19 @@ def calc_loss(predPAth, objPath, availPoints):
 # ------------------------ TF DATASET READER -------------------------------- #
 ###############################################################################
 
+def meta_dict_pass(dataset, **kwargs):
+    ''' 
+    Dataset wrapper for TensorFlow Data compatibility 
+    
+    Yields the dataset without any order
+        
+    Arguments:
+    dataset --- Agent dataset from Lyft library
+    '''
+
+    for frame in dataset:
+        yield frame
+
 def meta_dict_gen(dataset, 
                   randomize_frame=False, 
                   randomize_scene=False, 
@@ -336,7 +349,8 @@ def get_tf_dataset(dataset,
                    randomize_frame=False,
                    randomize_scene=False, 
                    num_scenes=16000, 
-                   frames_per_scene = -1):
+                   frames_per_scene = -1,
+                   meta_dict_use = meta_dict_gen):
     '''
     Creates a TensorFlow dict dataset from a Lyft dataset generator.
     
@@ -355,7 +369,7 @@ def get_tf_dataset(dataset,
     '''
 
 
-    return tf.data.Dataset.from_generator(lambda: meta_dict_gen(dataset,
+    return tf.data.Dataset.from_generator(lambda: meta_dict_use(dataset,
                                                                 randomize_frame=randomize_frame,
                                                                 randomize_scene=randomize_scene,
                                                                 num_scenes=num_scenes,
