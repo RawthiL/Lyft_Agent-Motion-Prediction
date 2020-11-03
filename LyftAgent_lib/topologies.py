@@ -492,6 +492,8 @@ def imageEncodingModel(base_img_model, cfg):
     model_map_input_shape      = (cfg["raster_params"]["raster_size"][0],
                                   cfg["raster_params"]["raster_size"][1])
     retrain_inputs_image_model = cfg["training_params"]["retrain_inputs_image_model"]
+    retrain_all_image_model = cfg["training_params"]["retrain_all_image_model"]
+    retrain_inputs_image_model = retrain_all_image_model or retrain_inputs_image_model
     map_input_channels         = 3+2 # RGB + Ego Fade + Agent Fade
    
     # Inputs
@@ -566,7 +568,7 @@ def imageEncodingModel(base_img_model, cfg):
         this_config = this_layer.get_config()
         this_weights = this_layer.get_weights()
         # Freeze the layer weights
-        this_config['trainable'] = False
+        this_config['trainable'] = retrain_all_image_model
         # Duplicate layer
         append_layer = this_layer.from_config(this_config)
         # Connect to all inbound layers   

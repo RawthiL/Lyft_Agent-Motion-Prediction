@@ -17,6 +17,93 @@ from l5kit.evaluation import metrics
 
 
 
+###############################################################################
+# ------------------------ LOSS FUNCTIONS ----------------------------------- #
+###############################################################################
+
+
+def tf_neg_multi_log_likelihood(
+    ground_truth: np.ndarray, pred: np.ndarray, confidences: np.ndarray, avails: np.ndarray
+) -> np.ndarray:
+    """
+    Compute a negative log-likelihood for the multi-modal scenario.
+    log-sum-exp trick is used here to avoid underflow and overflow, For more information about it see:
+    https://en.wikipedia.org/wiki/LogSumExp#log-sum-exp_trick_for_log-domain_calculations
+    https://timvieira.github.io/blog/post/2014/02/11/exp-normalize-trick/
+    https://leimao.github.io/blog/LogSumExp/
+    For more details about used loss function and reformulation, please see
+    https://github.com/lyft/l5kit/blob/master/competition.md.
+    Args:
+        ground_truth (np.ndarray): array of shape (timesteps)x(2D coords)
+        pred (np.ndarray): array of shape (modes)x(timesteps)x(2D coords)
+        confidences (np.ndarray): array of shape (modes) with a confidence for each mode in each sample
+        avails (np.ndarray): array of shape (timesteps) with the availability for each gt timesteps
+    Returns:
+        np.ndarray: negative log-likelihood for this example, a single float number
+    """
+
+    ground_truth = tf.expand_dims(ground_truth,  axis=0)  # add modes
+    avails = avails[np.newaxis, :, np.newaxis]  # add modes and cords
+
+    error = tf.reduce_sum(((ground_truth - pred) * avails) ** 2, axis=-1)  # reduce coords and use availability
+
+    with np.errstate(divide="ignore"):  # when confidence is 0 log goes to -inf, but we're fine with it
+        error = tf.math.log(confidences) - 0.5 * tf.reduce_sum(error, axis=-1)  # reduce timesteps
+
+    # use max aggregator on modes for numerical stability
+    max_value = tf.reduce_max(error)  # error are negative at this point, so max() gives the minimum one
+    error = -tf.math.log(tf.reduce_sum(tf.exp(error - max_value), axis=-1)) - max_value  # reduce modes
+    return error
+
+
+
+
+@tf.function
+def L_loss_single2mult(objPath, predPAth, availPoints):
+
+    out_L = list()
+    for idx_batch in range(objPath.shape[0]):
+        valLikelihood = tf_neg_multi_log_likelihood(objPath[idx_batch,:,:2], 
+                                                                    tf.expand_dims(predPAth[idx_batch,:,:2], axis=0), 
+                                                                    1.0, 
+                                                                    availPoints[idx_batch,:])
+
+        out_L.append(valLikelihood)
+
+    # Convert results list to tensor
+    out_L = tf.convert_to_tensor(out_L)
+
+    return out_L
+
+
+
+@tf.function
+def L2_loss(objPath, predPAth, availPoints):
+    '''
+    Calculate the mean L2 loss of the prediction.
+    
+    Arguments:
+    objPath --- Real path.
+    predPAth --- Predicted path.
+    availPoints --- Number valid real points.   
+        
+    Outputs:
+    out_loss --- Mean L2 loss.
+    '''
+    
+    # Mask with availability
+    predPAth = tf.multiply(predPAth, tf.tile(tf.expand_dims(availPoints,axis=-1), [1,1,3]))
+    objPath = tf.multiply(objPath, tf.tile(tf.expand_dims(availPoints,axis=-1), [1,1,3]))
+    # L2
+    out_loss = tf.reduce_sum((predPAth - objPath)**2, axis = -1)
+    out_loss = tf.reduce_sum(out_loss, axis = -1)
+    
+    # Get mean error for each sample in batch
+    stepsInfer_byBatch = tf.reduce_sum(availPoints, axis = -1)
+    
+    return tf.divide(out_loss, stepsInfer_byBatch)
+    
+
 
 
 ###############################################################################
@@ -30,6 +117,7 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
                          gen_loss,
                          initial_hidden_state,
                          forwardpass_use,
+                         loss_use = L2_loss,
                          stepsInfer = None,
                          use_teacher_force=True, 
                          teacher_force_weight = tf.constant(1.0, dtype=tf.float32)):
@@ -49,6 +137,9 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
     optimizer_gen --- Keras optimizer object.
     gen_loss --- Keras metric object.
     initial_hidden_state --- Initial hidden state of the decoder model.
+    forwardpass_use --- forward pas of the model.
+    loss_use --- loss to be computed.
+    stepsInfer --- number of future steps to infer.
     use_teacher_force --- Use a linear interpolation of the target path and the last predicted path.
     teacher_force_weight --- Fraction of the target path used in the linear interpolation between target and predicted.
     '''
@@ -68,20 +159,20 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
                                       teacher_force_weight = teacher_force_weight,
                                       target_path = target_path)      
         # Compute predicted path loss
-        gen_L2_loss = calc_loss(thisPath,target_path[:,:stepsInfer,:], TargetAvail[:,:stepsInfer])
+        gen_step_loss = loss_use(target_path[:,:stepsInfer,:], thisPath, TargetAvail[:,:stepsInfer])
         
     # Get list of trainable variables
     train_vars = ImageEncModel.trainable_variables+ \
                  HistEncModel.trainable_variables+ \
                  PathDecModel.trainable_variables
     # Compute gradient
-    grad_gen = gen_tape.gradient(target=gen_L2_loss, 
+    grad_gen = gen_tape.gradient(target=gen_step_loss, 
                                  sources=train_vars)
     # Apply update
     optimizer_gen.apply_gradients(zip(grad_gen, train_vars))
     
     # Save loss
-    gen_loss(tf.reduce_mean(gen_L2_loss))
+    gen_loss(tf.reduce_mean(gen_step_loss))
         
     return
 
@@ -187,11 +278,12 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
 
     valLikelihood_acum = 0
     valTime_displace_acum = 0
+
         
     val_dataset_prog_bar = tqdm(tf_validation_dataset, total=steps_validate)
     for (valSampleMapComp, valSampeHistPath, valSampeTargetPath, 
              valHistAvail, valTargetAvail, 
-         valTimeStamp, valTrackID, valRasterFromAgent) in val_dataset_prog_bar:
+             valTimeStamp, valTrackID, valRasterFromAgent, valWorldFromAgent, valCentroid) in val_dataset_prog_bar:
 
         # Predict
         PathDecModel.reset_states()
@@ -205,7 +297,7 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
 
         valPredPath = valPredPath.numpy()
         # Calculate loss
-        valLoss = calc_loss(valPredPath, valSampeTargetPath, valTargetAvail)
+        valLoss = L2_loss(valSampeTargetPath, valPredPath, valTargetAvail)
         valLoss = np.mean(valLoss.numpy())
 
         # Update 
@@ -214,17 +306,21 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
 
         # Process lyft metrics
         if all_metrics:
+            Time_displace_batch = 0
             for idx_batch in range(valPredPath.shape[0]):
-                valLikelihood_acum += metrics.neg_multi_log_likelihood(valSampeTargetPath[idx_batch,:,:2], 
-                                                                        np.expand_dims(valPredPath[idx_batch,:,:2], axis=0), 
-                                                                        np.ones((1)), 
-                                                                        valTargetAvail[idx_batch,:])
+                # valLikelihood_acum += metrics.neg_multi_log_likelihood(valSampeTargetPath[idx_batch,:,:2], 
+                #                                                         np.expand_dims(valPredPath[idx_batch,:,:2], axis=0), 
+                #                                                         np.ones((1)), 
+                #                                                         valTargetAvail[idx_batch,:])
 
-                valTime_displace_acum += metrics.time_displace(valSampeTargetPath[idx_batch,:,:2], 
+                Time_displace_batch += metrics.time_displace(valSampeTargetPath[idx_batch,:,:2], 
                                                                         np.expand_dims(valPredPath[idx_batch,:,:2], axis=0), 
                                                                         np.ones((1)), 
                                                                         valTargetAvail[idx_batch,:]) 
 
+            valTime_displace_acum += Time_displace_batch/valPredPath.shape[0]
+
+        valLikelihood_acum += np.mean(L_loss_single2mult(valSampeTargetPath, valPredPath, valTargetAvail))
                                                                              
 
 
@@ -250,36 +346,6 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
         return valLoss_acum/idx_val
 
 
-###############################################################################
-# ------------------------ LOSS FUNCTIONS ----------------------------------- #
-###############################################################################
-
-@tf.function
-def calc_loss(predPAth, objPath, availPoints):
-    '''
-    Calculate the mean L2 loss of the prediction.
-    
-    Arguments:
-    predPAth --- Predicted path.
-    objPath --- Real path.
-    availPoints --- Number valid real points.   
-        
-    Outputs:
-    out_loss --- Mean L2 loss.
-    '''
-    
-    # Mask with availability
-    predPAth = tf.multiply(predPAth, tf.tile(tf.expand_dims(availPoints,axis=-1), [1,1,3]))
-    objPath = tf.multiply(objPath, tf.tile(tf.expand_dims(availPoints,axis=-1), [1,1,3]))
-    # L2
-    out_loss = tf.reduce_sum((predPAth - objPath)**2, axis = -1)
-    out_loss = tf.reduce_sum(out_loss, axis = -1)
-    
-    # Get mean error for each sample in batch
-    stepsInfer_byBatch = tf.reduce_sum(availPoints, axis = -1)
-    
-    return tf.divide(out_loss, stepsInfer_byBatch)
-    
 
     
 
@@ -517,8 +583,11 @@ def tf_get_input_sample(datasetSample):
     timeStamp = datasetSample['timestamp']
     trackID = datasetSample['track_id']
     thisRasterFromAgent = datasetSample["raster_from_agent"]
+    thisWorldFromAgent = datasetSample["world_from_agent"]
+    thisCentroid = datasetSample["centroid"]
 
-    return sampleMapComp, sampleHistPath, sampleTargetPath, histAvail, targetAvail, timeStamp, trackID, thisRasterFromAgent
+
+    return sampleMapComp, sampleHistPath, sampleTargetPath, histAvail, targetAvail, timeStamp, trackID, thisRasterFromAgent, thisWorldFromAgent, thisCentroid
 
     
     
@@ -583,3 +652,53 @@ def load_model(load_path, load_name, use_keras=True, custom_obj_dict=[]):
         loaded_model.load_weights(os.path.join(load_path,load_name))
     
     return loaded_model
+
+
+def save_optimizer_state(optimizer, save_path, save_name):
+    '''
+    Save keras.optimizers object state.
+    
+    Arguments:
+    optimizer --- Optimizer object.
+    save_path --- Path to save location.
+    save_name --- Name of the .npy file to be created.
+
+    '''
+
+    # Create folder if it does not exists
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+    
+    # save weights
+    np.save(os.path.join(save_path, save_name), optimizer.get_weights())
+
+    return
+
+def load_optimizer_state(load_path, load_name, optimizer, model_train_vars):
+    '''
+    Loads keras.optimizers object state.
+    
+    Arguments:
+    load_path --- Path to save location.
+    load_name --- Name of the .npy file to be read.
+    optimizer --- Optimizer object to be loaded.
+    model_train_vars --- List of model variables (obtained using Model.trainable_variables)
+
+    '''
+
+    # Load optimizer weights
+    opt_weights = np.load(os.path.join(load_path, load_name)+'.npy', allow_pickle=True)
+
+    # dummy zero gradients
+    zero_grads = [tf.zeros_like(w) for w in model_train_vars]
+    # dummy weights to be updated (the same shape as the variables)
+    ones_vars = [tf.Variable(tf.ones_like(w)) for w in model_train_vars]
+
+    # Apply gradients which don't do nothing with Adam
+    optimizer.apply_gradients(zip(zero_grads, ones_vars))
+
+    # Set the weights of the optimizer
+    optimizer.set_weights(opt_weights)
+
+
+    return
