@@ -285,19 +285,19 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
              valHistAvail, valTargetAvail, 
              valTimeStamp, valTrackID, valRasterFromAgent, valWorldFromAgent, valCentroid) in val_dataset_prog_bar:
 
+
+        stepsInfer = valSampeTargetPath.shape[-2]
+
         # Predict
         PathDecModel.reset_states()
         HistEncModel.reset_states()
-        valPredPath = forwardpass_use(valSampleMapComp,
-                                                valSampeHistPath,
-                                                valHistAvail,
-                                                valSampeTargetPath.shape[-2], 
+        valPredPath = forwardpass_use(valSampleMapComp, valSampeHistPath, valHistAvail, stepsInfer, 
                                                 ImageEncModel, HistEncModel, PathDecModel,
                                                 use_teacher_force=False)
 
         valPredPath = valPredPath.numpy()
         # Calculate loss
-        valLoss = L2_loss(valSampeTargetPath, valPredPath, valTargetAvail)
+        valLoss = L2_loss(valSampeTargetPath[:,:stepsInfer,:], valPredPath, valTargetAvail[:,:stepsInfer])
         valLoss = np.mean(valLoss.numpy())
 
         # Update 
@@ -531,21 +531,21 @@ def tf_get_input_sample(datasetSample):
     
     # Get number of history frames
     num_hist_frames = datasetSample['history_positions'].shape[0]
+
+    image_splits = tf.split(datasetSample['image'], num_or_size_splits=[num_hist_frames, num_hist_frames, 3], axis=0)
     
     # Map to RGB
-    sampleMap = tf.transpose(datasetSample['image'][-3:,:,:], perm=[1, 2, 0])
+    sampleMap = tf.transpose(image_splits[2], perm=[1, 2, 0])
     sampleMap *= 255
     
     # Ego to fade
-    sampleEgoFade = create_fade_image(datasetSample['image'][-3-num_hist_frames-1:-3,:,:])
+    sampleEgoFade = create_fade_image(image_splits[1])
     sampleEgoFade /= tf.reduce_max(sampleEgoFade)
     sampleEgoFade *= 255
     sampleEgoFade = tf.expand_dims(sampleEgoFade, axis=-1)
     
-    
-    
     # Agents to fade
-    sampleAgentsFade = create_fade_image(datasetSample['image'][:-3-num_hist_frames-1,:,:])
+    sampleAgentsFade = create_fade_image(image_splits[0])
     sampleAgentsFade /= (tf.reduce_max(sampleAgentsFade)+1e-8) # Add a low value in case no other agent is present
     sampleAgentsFade *= 255
     sampleAgentsFade = tf.expand_dims(sampleAgentsFade, axis=-1)
@@ -691,11 +691,14 @@ def load_optimizer_state(load_path, load_name, optimizer, model_train_vars):
 
     # dummy zero gradients
     zero_grads = [tf.zeros_like(w) for w in model_train_vars]
-    # dummy weights to be updated (the same shape as the variables)
-    ones_vars = [tf.Variable(tf.ones_like(w)) for w in model_train_vars]
+    # save current state of variables
+    saved_vars = [tf.identity(w) for w in model_train_vars]
 
     # Apply gradients which don't do nothing with Adam
-    optimizer.apply_gradients(zip(zero_grads, ones_vars))
+    optimizer.apply_gradients(zip(zero_grads, model_train_vars))
+
+    # Reload variables
+    [x.assign(y) for x,y in zip(model_train_vars, saved_vars)]
 
     # Set the weights of the optimizer
     optimizer.set_weights(opt_weights)
