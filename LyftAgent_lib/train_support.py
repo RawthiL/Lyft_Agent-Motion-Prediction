@@ -110,6 +110,13 @@ def L2_loss(objPath, predPAth, availPoints):
 # ------------------------ CUSTOM TRAIN FUNCTIONS --------------------------- #
 ###############################################################################
 
+def get_mean_and_std_norm(tensor_list):
+    grad_norm_list = list()
+    [grad_norm_list.append(tf.norm(grad)) for grad in tensor_list]
+    grad_norm_list = tf.convert_to_tensor(grad_norm_list)
+
+    return  tf.reduce_mean(grad_norm_list), tf.math.reduce_std(grad_norm_list)
+
 @tf.function
 def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
                          ImageEncModel, HistEncModel, PathDecModel, 
@@ -118,9 +125,12 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
                          initial_hidden_state,
                          forwardpass_use,
                          loss_use = L2_loss,
-                         stepsInfer = None,
+                         stepsInfer = 50,
                          use_teacher_force=True, 
-                         teacher_force_weight = tf.constant(1.0, dtype=tf.float32)):
+                         teacher_force_weight = tf.constant(1.0, dtype=tf.float32),
+                         gradient_clip_value = 10.0,
+                         gradient_clip_thorugh_time_value = 1.0,
+                         stop_gradient_on_prediction = False):
     
     '''
     Calculate the mean L2 loss of the prediction.
@@ -145,11 +155,11 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
     '''
     
     # Get number of steps to generate
-    if stepsInfer == None:
-        stepsInfer = target_path.shape[1]
+    # if not tf.is_tensor(stepsInfer):
+    #     stepsInfer = target_path.shape[1]
     
     # Start gradient tape
-    with tf.GradientTape() as gen_tape:
+    with tf.GradientTape(persistent=True) as gen_tape:
               
         # Get predicted paths
         thisPath = forwardpass_use(img_t, hist_t, HistAvail, stepsInfer, 
@@ -157,24 +167,79 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
                                       thisHiddenState = initial_hidden_state, 
                                       use_teacher_force = use_teacher_force, 
                                       teacher_force_weight = teacher_force_weight,
-                                      target_path = target_path)      
+                                      target_path = target_path,
+                                      stop_gradient_on_prediction = stop_gradient_on_prediction,
+                                      gradient_clip_thorugh_time_value= gradient_clip_thorugh_time_value,
+                                      training_state = True)      
         # Compute predicted path loss
         gen_step_loss = loss_use(target_path[:,:stepsInfer,:], thisPath, TargetAvail[:,:stepsInfer])
-        
-    # Get list of trainable variables
-    train_vars = ImageEncModel.trainable_variables+ \
-                 HistEncModel.trainable_variables+ \
-                 PathDecModel.trainable_variables
-    # Compute gradient
-    grad_gen = gen_tape.gradient(target=gen_step_loss, 
-                                 sources=train_vars)
+
+    # Gradient wrt ImageEncModel
+    image_model_trainable =  len(ImageEncModel.trainable_variables)>0
+    if image_model_trainable:
+        grad_gen_img = gen_tape.gradient(target  = gen_step_loss,  
+                                        sources = ImageEncModel.trainable_variables)
+    # Gradient wrt HistEncModel
+    grad_gen_hist = gen_tape.gradient(target  = gen_step_loss,  
+                                      sources = HistEncModel.trainable_variables)
+    # Gradient wrt PathDecModel
+    grad_gen_dec  = gen_tape.gradient(target  = gen_step_loss,  
+                                      sources = PathDecModel.trainable_variables)
+    # Delete persistent gradient 
+    del gen_tape
+
+    # We now clip the recursive models
+    if image_model_trainable:
+        grad_gen_img = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_img]      
+    grad_gen_hist = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_hist]      
+    grad_gen_dec = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_dec]      
+    # grad_gen_hist = [tf.clip_by_value(grad, 
+    #                                    clip_value_min=-gradient_clip_value, 
+    #                                    clip_value_max=gradient_clip_value) 
+    #                   for grad in grad_gen_hist]
+    # grad_gen_dec = [tf.clip_by_value(grad, 
+    #                                    clip_value_min=-gradient_clip_value, 
+    #                                    clip_value_max=gradient_clip_value) 
+    #                   for grad in grad_gen_dec]
+    # 
+
+   
+    # Log gradient norms for each model
+    out_grad_mean = list()
+    out_grad_std = list()
+    if image_model_trainable:
+        mean_norm_grad_img, std_norm_grad_img = get_mean_and_std_norm(grad_gen_img)
+        out_grad_mean.append(mean_norm_grad_img)
+        out_grad_std.append(std_norm_grad_img)
+    mean_norm_grad_hist, std_norm_grad_hist = get_mean_and_std_norm(grad_gen_hist)
+    out_grad_mean.append(mean_norm_grad_hist)
+    out_grad_std.append(std_norm_grad_hist)
+    mean_norm_grad_dec, std_norm_grad_dec = get_mean_and_std_norm(grad_gen_dec)
+    out_grad_mean.append(mean_norm_grad_dec)
+    out_grad_std.append(std_norm_grad_dec)      
+
+    # Get full list of trainable variables and gradients
+    train_vars = list()
+    if image_model_trainable:
+        train_vars += ImageEncModel.trainable_variables
+    train_vars += HistEncModel.trainable_variables
+    train_vars += PathDecModel.trainable_variables
+    grad_gen_clip = list()
+    if image_model_trainable:
+        grad_gen_clip += grad_gen_img
+    grad_gen_clip += grad_gen_hist
+    grad_gen_clip += grad_gen_dec
+
     # Apply update
-    optimizer_gen.apply_gradients(zip(grad_gen, train_vars))
+    optimizer_gen.apply_gradients(zip(grad_gen_clip, train_vars))
+
+    
     
     # Save loss
     gen_loss(tf.reduce_mean(gen_step_loss))
         
-    return
+    return gen_step_loss, out_grad_mean, out_grad_std
+
 
 def get_teacher_force_weight(tf_list, tf_lims, epoch, tf_weight_act, linearize=False):
     '''
@@ -220,7 +285,7 @@ def update_lr(lr_list, lr_lims, epoch, optimizer):
     # Get new learning rate
     lr_new = lr_list[np.squeeze(np.argwhere(np.array(lr_lims) >= epoch)[0])]
     # Update and inform if needed
-    if not np.isclose(lr_new, optimizer.learning_rate.numpy(), rtol = 1e-8):
+    if not np.isclose(lr_new, optimizer.learning_rate.numpy(), rtol = 1e-10):
         K.set_value(optimizer.learning_rate, lr_new)
         print('Learning rate set to: %g'%optimizer.learning_rate.numpy())
         
@@ -258,7 +323,7 @@ def get_future_steps_train(fs_list, fs_lims, epoch, fs_act):
 ###############################################################################
 
 def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecModel, forwardpass_use,
-                   steps_validate = None, all_metrics = False):
+                   steps_validate = None, all_metrics = False, stepsInfer = -1):
     '''
     Validate the generator model using the validation dataset.
     
@@ -279,14 +344,17 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
     valLikelihood_acum = 0
     valTime_displace_acum = 0
 
-        
+
+    custom_steps = True
     val_dataset_prog_bar = tqdm(tf_validation_dataset, total=steps_validate)
     for (valSampleMapComp, valSampeHistPath, valSampeTargetPath, 
              valHistAvail, valTargetAvail, 
-             valTimeStamp, valTrackID, valRasterFromAgent, valWorldFromAgent, valCentroid) in val_dataset_prog_bar:
+             valTimeStamp, valTrackID, valRasterFromAgent, valWorldFromAgent, valCentroid, valIDX) in val_dataset_prog_bar:
 
 
-        stepsInfer = valSampeTargetPath.shape[-2]
+        if stepsInfer == -1:
+            custom_steps = False
+            stepsInfer = valSampeTargetPath.shape[-2]
 
         # Predict
         PathDecModel.reset_states()
@@ -313,14 +381,14 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
                 #                                                         np.ones((1)), 
                 #                                                         valTargetAvail[idx_batch,:])
 
-                Time_displace_batch += metrics.time_displace(valSampeTargetPath[idx_batch,:,:2], 
-                                                                        np.expand_dims(valPredPath[idx_batch,:,:2], axis=0), 
+                Time_displace_batch += metrics.time_displace(valSampeTargetPath[idx_batch,:stepsInfer,:2], 
+                                                                        np.expand_dims(valPredPath[idx_batch,:stepsInfer,:2], axis=0), 
                                                                         np.ones((1)), 
-                                                                        valTargetAvail[idx_batch,:]) 
+                                                                        valTargetAvail[idx_batch,:stepsInfer]) 
 
             valTime_displace_acum += Time_displace_batch/valPredPath.shape[0]
 
-        valLikelihood_acum += np.mean(L_loss_single2mult(valSampeTargetPath, valPredPath, valTargetAvail))
+        valLikelihood_acum += np.mean(L_loss_single2mult(valSampeTargetPath[:,:stepsInfer,:], valPredPath, valTargetAvail[:,:stepsInfer]))
                                                                              
 
 
@@ -329,10 +397,13 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
             msg_string = 'Validation: L2 = %.2f ; L = %.2f ; TD(T) = %0.2f '%( (valLoss_acum/(idx_val+1)),
                                                                             (valLikelihood_acum/(idx_val+1)),
                                                                             (valTime_displace_acum[-1]/(idx_val+1)))
-            val_dataset_prog_bar.set_description(msg_string)
         else:
             msg_string = 'Validation: L2 Loss: %.2f (last %.2f) '%(valLoss_acum/(idx_val+1), valLoss)
-            val_dataset_prog_bar.set_description(msg_string)
+
+        if custom_steps:
+            msg_string += ' (on %d steps)'%stepsInfer
+
+        val_dataset_prog_bar.set_description(msg_string)
 
 
         idx_val += 1
@@ -363,14 +434,16 @@ def meta_dict_pass(dataset, **kwargs):
     dataset --- Agent dataset from Lyft library
     '''
 
-    for frame in dataset:
+    for sample_index, frame in enumerate(dataset):
+        frame['sample_idx'] = sample_index
         yield frame
 
 def meta_dict_gen(dataset, 
                   randomize_frame=False, 
                   randomize_scene=False, 
                   num_scenes=16000, 
-                  frames_per_scene = -1):
+                  frames_per_scene = -1,
+                  yield_only_large_distances = False):
     ''' 
     Dataset generator wrapper for TensorFlow Data compatibility 
     
@@ -395,18 +468,33 @@ def meta_dict_gen(dataset,
 
         # Frame order (incremental)
         this_scene_idxs = dataset.get_scene_indices(scene_idx)
+        if this_scene_idxs.size < 1:
+            pass
         # Shuffle frame order if requested
         if randomize_frame:
             np.random.shuffle(this_scene_idxs)
-            
+        
         # Get the number of frames to yield from this scene
-        if frames_per_scene<1:
-            frames_per_scene = this_scene_idxs.shape[0]
         if frames_per_scene > this_scene_idxs.shape[0]:
+            frames_per_scene = this_scene_idxs.shape[0]
+        elif frames_per_scene<1:
             frames_per_scene = this_scene_idxs.shape[0]
         # Yield the number of requested frames of this scene
         for frame_idx in range(frames_per_scene):
-                yield dataset[this_scene_idxs[frame_idx]]
+            sample_index = this_scene_idxs[frame_idx]
+            sample_out = dataset[sample_index]
+            
+            
+            if yield_only_large_distances:
+                dist_max = np.sqrt(sample_out['target_positions'][np.sum(sample_out['target_availabilities']),0]**2\
+                                  +sample_out['target_positions'][np.sum(sample_out['target_availabilities']),1]**2)
+                if dist_max < 25.0:
+                    pass
+
+            # add index to sample
+            sample_out['sample_idx'] = sample_index
+            yield sample_out
+    print('Dataset exhausted')
                 
 def get_tf_dataset(dataset, 
                    num_hist_frames,
@@ -434,6 +522,8 @@ def get_tf_dataset(dataset,
     tf_dataset --- TensorFlow Dataset object.
     '''
 
+    print('Creating dataset with: \n\t Randomized scenes: %r\n\t Randomized frames: %r\n\t Number of scenes: %d\n\t Number of frames per scenes: %d'%(randomize_frame, randomize_scene, num_scenes, frames_per_scene))
+
 
     return tf.data.Dataset.from_generator(lambda: meta_dict_use(dataset,
                                                                 randomize_frame=randomize_frame,
@@ -456,7 +546,8 @@ def get_tf_dataset(dataset,
                                                         'timestamp': tf.int64,
                                                         'centroid': tf.float32,
                                                         'yaw': tf.float32,
-                                                        'extent': tf.float32},
+                                                        'extent': tf.float32,
+                                                        'sample_idx': tf.int32},
                                           output_shapes={'image': (3+num_hist_frames*2+2, 
                                                                    map_input_shape[0], 
                                                                    map_input_shape[1]), 
@@ -475,7 +566,8 @@ def get_tf_dataset(dataset,
                                                          'timestamp': (),
                                                          'centroid': (2,),
                                                          'yaw': (),
-                                                         'extent': (3,)})
+                                                         'extent': (3,),
+                                                         'sample_idx': ()})
 
 
 def create_fade_image(input_multiCh_image, fade_factor = 0.75, update_threshold = 0.1):
@@ -508,7 +600,7 @@ def create_fade_image(input_multiCh_image, fade_factor = 0.75, update_threshold 
     
 
 # Sample conformation functions (tf and numpy)
-def tf_get_input_sample(datasetSample):
+def tf_get_input_sample(datasetSample, image_preprocess_fcn = lambda x: x):
     '''
     Tensorflow sample mapping function.
     
@@ -537,18 +629,21 @@ def tf_get_input_sample(datasetSample):
     # Map to RGB
     sampleMap = tf.transpose(image_splits[2], perm=[1, 2, 0])
     sampleMap *= 255
+    sampleMap = image_preprocess_fcn(sampleMap)
     
     # Ego to fade
     sampleEgoFade = create_fade_image(image_splits[1])
     sampleEgoFade /= tf.reduce_max(sampleEgoFade)
     sampleEgoFade *= 255
     sampleEgoFade = tf.expand_dims(sampleEgoFade, axis=-1)
+    sampleEgoFade = image_preprocess_fcn(sampleEgoFade)
     
     # Agents to fade
     sampleAgentsFade = create_fade_image(image_splits[0])
     sampleAgentsFade /= (tf.reduce_max(sampleAgentsFade)+1e-8) # Add a low value in case no other agent is present
     sampleAgentsFade *= 255
     sampleAgentsFade = tf.expand_dims(sampleAgentsFade, axis=-1)
+    sampleAgentsFade = image_preprocess_fcn(sampleAgentsFade)
     
     # Concatenate image inputs
     sampleMapComp = tf.concat([sampleMap, sampleEgoFade, sampleAgentsFade], axis = -1)
@@ -585,9 +680,9 @@ def tf_get_input_sample(datasetSample):
     thisRasterFromAgent = datasetSample["raster_from_agent"]
     thisWorldFromAgent = datasetSample["world_from_agent"]
     thisCentroid = datasetSample["centroid"]
+    thisSampleIdx = datasetSample['sample_idx']
 
-
-    return sampleMapComp, sampleHistPath, sampleTargetPath, histAvail, targetAvail, timeStamp, trackID, thisRasterFromAgent, thisWorldFromAgent, thisCentroid
+    return sampleMapComp, sampleHistPath, sampleTargetPath, histAvail, targetAvail, timeStamp, trackID, thisRasterFromAgent, thisWorldFromAgent, thisCentroid, thisSampleIdx
 
     
     

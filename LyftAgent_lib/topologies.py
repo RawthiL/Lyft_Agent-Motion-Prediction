@@ -23,7 +23,10 @@ def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
                        use_teacher_force = False, 
                        teacher_force_weight = tf.constant(1.0), 
                        target_path=None,
-                       stop_gradient_on_prediction = False):
+                       stop_gradient_on_prediction = False,
+                       gradient_clip_thorugh_time_value = 10.0,
+                       return_attention = False,
+                       training_state=False):
     '''
     Forward pass of the path decoding model V2.
     
@@ -65,13 +68,18 @@ def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
     
 
     # Process input image
-    img_feats = ImageEncModel(img_t)  
+    img_feats = ImageEncModel(img_t, training = training_state)  
 
     # Process history
     hist_out_list = list()
     hist_hidden_list = list()
     for idx_step_hist in range(stepsHist):
-        hist_outs, hist_states = HistEncModel(tf.expand_dims(hist_t[:,stepsHist-1-idx_step_hist,:], 1))
+        hist_outs, hist_states = HistEncModel(tf.expand_dims(hist_t[:,stepsHist-1-idx_step_hist,:], 1), training = training_state)
+
+        # Clip gradients each time step!!
+        hist_outs = clip_gradients_000001(hist_outs)
+        hist_states = clip_gradients_000001(hist_states)
+
         hist_out_list.append(hist_outs)
         hist_hidden_list.append(hist_states)
 
@@ -85,11 +93,13 @@ def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
         
     # Reset decoder model states to last state of HistEncModel
     thisHiddenState = tf.squeeze(hist_states[:,-1,:])
-    # PathDecModel.reset_states(states = thisHiddenState) # Not implemented for model (tf 2.3 API)
     reset_states(PathDecModel, layer_states_dict = {'gru':  thisHiddenState})
                        
     # Output List
     out_list = list()
+    if return_attention:
+        out_img_attention = list()
+        out_hist_attention = list()
 
     # Create requested path points
     nextPath = tf.squeeze(hist_t[:,0,:]) # Process current step first
@@ -97,16 +107,26 @@ def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
         
         if stop_gradient_on_prediction:
             nextPath = tf.stop_gradient(nextPath)
+
+        # Clip gradients each time step!!
+        nextPath = clip_gradients_000001(nextPath)
+        img_feats = clip_gradients_000001(img_feats)
+        hist_outs = clip_gradients_000001(hist_outs)
+        hist_states = clip_gradients_000001(hist_states)
+        thisHiddenState = clip_gradients_000001(thisHiddenState)
             
         # Get predicted step using decoder
-        thisPath, thisHiddenState, _, _ = PathDecModel([nextPath,
+        thisPath, thisHiddenState, atten_img, atten_hist = PathDecModel([nextPath,
                                                        img_feats, 
                                                        hist_outs, 
                                                        hist_states, 
-                                                       thisHiddenState])
+                                                       thisHiddenState], training = training_state)
         
         # Add out step
         out_list.append(thisPath)
+        if return_attention:
+            out_img_attention.append(atten_img)
+            out_hist_attention.append(atten_hist)
 
         # Apply teacher forcing
         if use_teacher_force:
@@ -125,7 +145,10 @@ def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
     # Transpose match dimension order
     out_list = tf.transpose(out_list, (1,0,2))
     
-    return out_list
+    if return_attention:
+        return out_list, out_img_attention, out_hist_attention
+    else:
+        return out_list
 
 
 @tf.function
@@ -254,6 +277,8 @@ def pathDecoderModel_V2(cfg, ImageEncModel, HistEncModel):
     num_path_decode_fc_layers  = cfg["model_params"]["num_path_decode_fc_layers"]
     path_decode_fc_units       = cfg["model_params"]["path_decode_fc_units"]
     path_decode_fc_activation  = cfg["model_params"]["path_decode_fc_activation"]
+    increment_net              = cfg["model_params"]["increment_net"]
+    path_noise_level           = cfg["model_params"]["path_noise_level"]
 
     imageProcPixelNum          = ImageEncModel.output_shape[1]
     imageProcFeatNum           = ImageEncModel.output_shape[2]
@@ -269,6 +294,8 @@ def pathDecoderModel_V2(cfg, ImageEncModel, HistEncModel):
                                          name="Input_Last_Hidden_State")
     Input_position = keras.Input(batch_shape=(gen_batch_size, 3), name="Input_position")
 
+    # Add noise
+    in_position = tf.keras.layers.GaussianNoise(path_noise_level)(Input_position)
 
     # Set attention mechanism for image
     imageAttnFeatT, attenScores_image = BahdanauAttention(pathDec_attention_pr_units)([Input_Last_Hidden_State, Input_Image_Features])
@@ -278,10 +305,11 @@ def pathDecoderModel_V2(cfg, ImageEncModel, HistEncModel):
 
     # Project the physical attention to a lower space (matching path history encoding)
     imageAttnFeatT = keras.layers.Dense(histEnc_recurrent_unit_num,
-                                         activation='relu')(imageAttnFeatT)
+                                        kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
+                                        activation=keras.layers.LeakyReLU(alpha=0.1))(imageAttnFeatT)
 
     # Concatenate feature tensors with current position
-    featT = keras.layers.Concatenate(axis=-1)([imageAttnFeatT, histAttnFeatT, Input_position])
+    featT = keras.layers.Concatenate(axis=-1)([imageAttnFeatT, histAttnFeatT, in_position])
 
 
     # Get recurrent unit to use
@@ -293,16 +321,24 @@ def pathDecoderModel_V2(cfg, ImageEncModel, HistEncModel):
     # Apply recurrent output
     featT = K.expand_dims(featT, 1)
     featOutT, featHidT  = pathDec_base_recurrent_unit(pathDec_recurrent_unit_num,
+                                                        kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
+                                                        recurrent_regularizer=keras.regularizers.l1_l2(0.01,0.01),
+                                                        # bias_regularizer=keras.regularizers.l2(0.001),
                                                       stateful=True,
                                                       return_state=True)(featT)
 
     # Get predicted position
     for idx_decode_layer in range(num_path_decode_fc_layers):
         featOutT = keras.layers.Dense(path_decode_fc_units[idx_decode_layer],
+                                      kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
                                       activation = path_decode_fc_activation)(featOutT)
     # Last output
     pathOut = keras.layers.Dense(3,
+                                kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
                                 activation = None)(featOutT)
+
+    if increment_net:
+        pathOut += Input_position
 
     # Create model
     return keras.Model([Input_position,
@@ -372,7 +408,7 @@ def pathDecoderModel_V1(cfg, ImageEncModel, HistEncModel):
 
     # Project the physical attention to a lower space (matching path history encoding)
     imageAttenFeatT = keras.layers.Dense(histEnc_recurrent_unit_num,
-                                         activation='relu')(imageAttenFeatT)
+                                         activation=keras.layers.LeakyReLU(alpha=0.1))(imageAttenFeatT)
 
     # Concatenate feature tensors
     # featT = keras.layers.Concatenate(axis=-1)([imageAttenFeatT, histAttenFeatT])
@@ -434,16 +470,21 @@ def pathEncodingModel(cfg, return_sequences=False, CarNet = False):
     histEnc_recurrent_unit_num = cfg["model_params"]["history_encoder_recurrent_units_number"]
     num_hist_encode_layers     = cfg["model_params"]["num_hist_encode_layers"]
     hist_encode_units          = cfg["model_params"]["hist_encode_units"]
-    hist_encode_activation     = cfg["model_params"]["hist_encode_activation"]
+    path_noise_level           = cfg["model_params"]["path_noise_level"]
+    # hist_encode_activation     = cfg["model_params"]["hist_encode_activation"]
+    hist_encode_activation     = keras.layers.LeakyReLU(alpha=0.1)
 
     # Inputs
     Input_hist_frames = keras.Input(batch_shape=(gen_batch_size, 1, 3), 
                                     name="Input_history_frames")
 
+    # Add noise
+    pathFeatT = tf.keras.layers.GaussianNoise(path_noise_level)(Input_hist_frames)
+
     # History encoding dense layers
-    pathFeatT = Input_hist_frames
     for idx_encode_layer in range(num_hist_encode_layers):
         pathFeatT = keras.layers.Dense(hist_encode_units[idx_encode_layer],
+                                       kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
                                        activation=hist_encode_activation)(pathFeatT)
 
     if not CarNet:
@@ -455,6 +496,9 @@ def pathEncodingModel(cfg, return_sequences=False, CarNet = False):
     
         # Recurrent encoding
         outs  = histEnc_base_recurrent_unit(histEnc_recurrent_unit_num,
+                                            kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
+                                            recurrent_regularizer=keras.regularizers.l1_l2(0.01,0.01),
+                                            # bias_regularizer=keras.regularizers.l2(0.001),
                                             return_state=True,
                                             return_sequences=return_sequences,
                                             stateful=True)(pathFeatT)
@@ -596,6 +640,26 @@ def imageEncodingModel(base_img_model, cfg):
 ###############################################################################
 # ------------------------ CUSTOM LAYERS AND FUNCTIONS ---------------------- #
 ###############################################################################
+
+# def clip_gradients(y):
+#     return tf.py_function(func=tf_clip_gradients, inp=[y], Tout=tf.float32)
+
+
+# Custom gradient clip for RNN
+@tf.custom_gradient
+def clip_gradients_00001(y):
+    def backward(dy):
+        return tf.clip_by_norm(dy, 0.1)
+        # return tf.clip_by_value(dy, clip_value_max=0.01, clip_value_min=-0.01)
+    return y, backward
+
+@tf.custom_gradient
+def clip_gradients_000001(y):
+    def backward(dy):
+        return tf.clip_by_norm(dy, 0.1)
+        # return tf.clip_by_value(dy, clip_value_max=0.001, clip_value_min=-0.001)
+    return y, backward
+
 
 # Attention layer from https://www.tensorflow.org/tutorials/text/nmt_with_attention
 # (with some modifications for save/load operations)
