@@ -424,6 +424,25 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
 # ------------------------ TF DATASET READER -------------------------------- #
 ###############################################################################
 
+# def generate_scene_indexes(dataset, num_scenes=-1):
+
+#     if num_scenes < 1:
+#         num_scenes = len(dataset.dataset.scenes)
+
+#     # Scene order (incremental)
+#     scene_order = np.arange(num_scenes)
+#     # Get the indexes for each scene
+#     index_list = list()
+#     iterador = tqdm(scene_order)
+#     iterador.set_description('Generating scene idexes')
+#     for scene_idx in iterador:
+#         # get frame indexes
+#         index_list.append(dataset.get_scene_indices(scene_idx))
+
+#     return index_list
+
+
+
 def meta_dict_pass(dataset, **kwargs):
     ''' 
     Dataset wrapper for TensorFlow Data compatibility 
@@ -442,7 +461,7 @@ def meta_dict_gen(dataset,
                   randomize_frame=False, 
                   randomize_scene=False, 
                   num_scenes=16000, 
-                  frames_per_scene = -1,
+                  frames_per_scene = 1,
                   yield_only_large_distances = False):
     ''' 
     Dataset generator wrapper for TensorFlow Data compatibility 
@@ -457,11 +476,49 @@ def meta_dict_gen(dataset,
     frames_per_scene --- Number of frames to yield per scene (-1 means all)
     '''
 
+    desired_frames_per_scene = frames_per_scene
+
     # Scene order (incremental)
     scene_order = np.arange(num_scenes)
     # Shuffle scene order if requested
     if randomize_scene:
         np.random.shuffle(scene_order)
+
+    
+
+    # # loop all scenes
+    # for scene_idx in scene_order:
+    #     # Frame order (incremental)
+    #     this_scene_idxs = indexes_list[scene_idx]
+    #     if this_scene_idxs.size < 1:
+    #         continue
+    #     # # Shuffle frame order if requested
+    #     # if randomize_frame:
+    #     #     np.random.shuffle(this_scene_idxs)
+        
+    #     # # Get the number of frames to yield from this scene
+    #     # if frames_per_scene > this_scene_idxs.shape[0]:
+    #     #     frames_per_scene = this_scene_idxs.shape[0]
+    #     # elif frames_per_scene<1:
+    #     #     frames_per_scene = this_scene_idxs.shape[0]
+    #     # Yield the number of requested frames of this scene
+    #     for frame_idx in range(frames_per_scene):
+    #         sample_index = this_scene_idxs[frame_idx]
+    #         sample_out = dataset[sample_index]
+            
+            
+    #         if yield_only_large_distances:
+    #             dist_max = np.sqrt(sample_out['target_positions'][np.sum(sample_out['target_availabilities']),0]**2\
+    #                               +sample_out['target_positions'][np.sum(sample_out['target_availabilities']),1]**2)
+    #             if dist_max < 25.0:
+    #                 continue
+
+    #         # add index to sample
+    #         sample_out['sample_idx'] = sample_index
+    #         yield sample_out
+
+
+
 
     # For each scene in the dataset
     for scene_idx in scene_order:
@@ -469,16 +526,18 @@ def meta_dict_gen(dataset,
         # Frame order (incremental)
         this_scene_idxs = dataset.get_scene_indices(scene_idx)
         if this_scene_idxs.size < 1:
-            pass
+            continue
         # Shuffle frame order if requested
         if randomize_frame:
             np.random.shuffle(this_scene_idxs)
         
         # Get the number of frames to yield from this scene
-        if frames_per_scene > this_scene_idxs.shape[0]:
+        if desired_frames_per_scene > this_scene_idxs.shape[0]:
             frames_per_scene = this_scene_idxs.shape[0]
-        elif frames_per_scene<1:
+        elif desired_frames_per_scene<1:
             frames_per_scene = this_scene_idxs.shape[0]
+        else:
+            frames_per_scene = desired_frames_per_scene
         # Yield the number of requested frames of this scene
         for frame_idx in range(frames_per_scene):
             sample_index = this_scene_idxs[frame_idx]
@@ -489,12 +548,12 @@ def meta_dict_gen(dataset,
                 dist_max = np.sqrt(sample_out['target_positions'][np.sum(sample_out['target_availabilities']),0]**2\
                                   +sample_out['target_positions'][np.sum(sample_out['target_availabilities']),1]**2)
                 if dist_max < 25.0:
-                    pass
+                    continue
 
             # add index to sample
             sample_out['sample_idx'] = sample_index
             yield sample_out
-    print('Dataset exhausted')
+    return
                 
 def get_tf_dataset(dataset, 
                    num_hist_frames,
