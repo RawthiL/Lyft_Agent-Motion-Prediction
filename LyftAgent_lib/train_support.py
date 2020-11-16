@@ -117,6 +117,81 @@ def get_mean_and_std_norm(tensor_list):
 
     return  tf.reduce_mean(grad_norm_list), tf.math.reduce_std(grad_norm_list)
 
+
+@tf.function
+def generator_train_step_Base(img_t, target_path, TargetAvail, ImageEncModel, PathDecModel, 
+                             optimizer_gen, 
+                             gen_loss,
+                             forwardpass_use,
+                             loss_use = [L2_loss],
+                             loss_couplings = [1],
+                             gradient_clip_value = 10.0):
+
+    stepsInfer = PathDecModel.output.shape[1]
+
+    # Start gradient tape
+    with tf.GradientTape(persistent=True) as gen_tape:
+              
+        # Get predicted paths
+        with tf.name_scope("Forward_pass"):
+            thisPath = forwardpass_use(img_t, ImageEncModel, PathDecModel, training_state = True)      
+
+        with tf.name_scope("Loss"):
+            # Compute predicted path loss
+            gen_step_loss_list = list()
+            gen_step_loss = 0
+            for loss_this, k_coup in zip(loss_use, loss_couplings):
+                gen_step_loss_list.append(loss_this(target_path[:,:stepsInfer,:], thisPath, TargetAvail[:,:stepsInfer]))
+                gen_step_loss += k_coup*gen_step_loss_list[-1]
+
+    with tf.name_scope("Gradient_calc"):
+        # Gradient wrt ImageEncModel
+        image_model_trainable =  len(ImageEncModel.trainable_variables)>0
+        if image_model_trainable:
+            grad_gen_img = gen_tape.gradient(target  = gen_step_loss,  
+                                            sources = ImageEncModel.trainable_variables)
+        # Gradient wrt PathDecModel
+        grad_gen_dec  = gen_tape.gradient(target  = gen_step_loss,  
+                                        sources = PathDecModel.trainable_variables)
+        # Delete persistent gradient 
+        del gen_tape
+
+        # We now clip the recursive models
+        if image_model_trainable:
+        #     grad_gen_img = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_img]      
+            grad_gen_img, _ = tf.clip_by_global_norm(grad_gen_img, gradient_clip_value)      
+        
+        grad_gen_dec, _ = tf.clip_by_global_norm(grad_gen_dec, gradient_clip_value)
+        
+        train_vars = list()
+        if image_model_trainable:
+            train_vars += ImageEncModel.trainable_variables
+        train_vars += PathDecModel.trainable_variables
+        grad_gen_clip = list()
+        if image_model_trainable:
+            grad_gen_clip += grad_gen_img
+        grad_gen_clip += grad_gen_dec
+
+        # Apply update
+        optimizer_gen.apply_gradients(zip(grad_gen_clip, train_vars))
+   
+    # Log gradient norms for each model
+    out_grad = list()
+    if image_model_trainable:
+        out_grad.append(grad_gen_img)        
+    out_grad.append(grad_gen_dec)
+      
+
+    
+
+    
+    
+    # Save loss
+    gen_loss(tf.reduce_mean(gen_step_loss))
+        
+    return gen_step_loss_list, out_grad
+
+
 @tf.function
 def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
                          ImageEncModel, HistEncModel, PathDecModel, 
@@ -124,7 +199,8 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
                          gen_loss,
                          initial_hidden_state,
                          forwardpass_use,
-                         loss_use = L2_loss,
+                         loss_use = [L2_loss],
+                         loss_couplings = [1],
                          stepsInfer = 50,
                          use_teacher_force=True, 
                          teacher_force_weight = tf.constant(1.0, dtype=tf.float32),
@@ -158,87 +234,94 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
     # if not tf.is_tensor(stepsInfer):
     #     stepsInfer = target_path.shape[1]
     
+
     # Start gradient tape
     with tf.GradientTape(persistent=True) as gen_tape:
               
         # Get predicted paths
-        thisPath = forwardpass_use(img_t, hist_t, HistAvail, stepsInfer, 
-                                      ImageEncModel, HistEncModel, PathDecModel,
-                                      thisHiddenState = initial_hidden_state, 
-                                      use_teacher_force = use_teacher_force, 
-                                      teacher_force_weight = teacher_force_weight,
-                                      target_path = target_path,
-                                      stop_gradient_on_prediction = stop_gradient_on_prediction,
-                                      gradient_clip_thorugh_time_value= gradient_clip_thorugh_time_value,
-                                      training_state = True)      
-        # Compute predicted path loss
-        gen_step_loss = loss_use(target_path[:,:stepsInfer,:], thisPath, TargetAvail[:,:stepsInfer])
+        with tf.name_scope("Forward_pass"):
+            thisPath = forwardpass_use(img_t, hist_t, HistAvail, stepsInfer, 
+                                        ImageEncModel, HistEncModel, PathDecModel,
+                                        thisHiddenState = initial_hidden_state, 
+                                        use_teacher_force = use_teacher_force, 
+                                        teacher_force_weight = teacher_force_weight,
+                                        target_path = target_path,
+                                        stop_gradient_on_prediction = stop_gradient_on_prediction,
+                                        gradient_clip_thorugh_time_value= gradient_clip_thorugh_time_value,
+                                        training_state = True)      
 
-    # Gradient wrt ImageEncModel
-    image_model_trainable =  len(ImageEncModel.trainable_variables)>0
-    if image_model_trainable:
-        grad_gen_img = gen_tape.gradient(target  = gen_step_loss,  
-                                        sources = ImageEncModel.trainable_variables)
-    # Gradient wrt HistEncModel
-    grad_gen_hist = gen_tape.gradient(target  = gen_step_loss,  
-                                      sources = HistEncModel.trainable_variables)
-    # Gradient wrt PathDecModel
-    grad_gen_dec  = gen_tape.gradient(target  = gen_step_loss,  
-                                      sources = PathDecModel.trainable_variables)
-    # Delete persistent gradient 
-    del gen_tape
+        with tf.name_scope("Loss"):
+            # Compute predicted path loss
+            gen_step_loss_list = list()
+            gen_step_loss = 0
+            for loss_this, k_coup in zip(loss_use, loss_couplings):
+                loss_act = loss_this(target_path[:,:stepsInfer,:], thisPath, TargetAvail[:,:stepsInfer])
+                gen_step_loss_list.append(loss_act)
+                gen_step_loss += k_coup*loss_act
 
-    # We now clip the recursive models
-    if image_model_trainable:
-        grad_gen_img = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_img]      
-    grad_gen_hist = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_hist]      
-    grad_gen_dec = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_dec]      
-    # grad_gen_hist = [tf.clip_by_value(grad, 
-    #                                    clip_value_min=-gradient_clip_value, 
-    #                                    clip_value_max=gradient_clip_value) 
-    #                   for grad in grad_gen_hist]
-    # grad_gen_dec = [tf.clip_by_value(grad, 
-    #                                    clip_value_min=-gradient_clip_value, 
-    #                                    clip_value_max=gradient_clip_value) 
-    #                   for grad in grad_gen_dec]
-    # 
+    with tf.name_scope("Gradient_calc"):
+        # Gradient wrt ImageEncModel
+        image_model_trainable =  len(ImageEncModel.trainable_variables)>0
+        if image_model_trainable:
+            grad_gen_img = gen_tape.gradient(target  = gen_step_loss,  
+                                            sources = ImageEncModel.trainable_variables)
+        # Gradient wrt HistEncModel
+        grad_gen_hist = gen_tape.gradient(target  = gen_step_loss,  
+                                        sources = HistEncModel.trainable_variables)
+        # Gradient wrt PathDecModel
+        grad_gen_dec  = gen_tape.gradient(target  = gen_step_loss,  
+                                        sources = PathDecModel.trainable_variables)
+        # Delete persistent gradient 
+        del gen_tape
 
+        # We now clip the recursive models
+        if image_model_trainable:
+        #     grad_gen_img = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_img]      
+            grad_gen_img, _ = tf.clip_by_global_norm(grad_gen_img, gradient_clip_value)      
+        # grad_gen_hist = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_hist]      
+        # grad_gen_dec = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_dec]     
+        grad_gen_hist, _ = tf.clip_by_global_norm(grad_gen_hist, gradient_clip_value)
+        grad_gen_dec, _ = tf.clip_by_global_norm(grad_gen_dec, gradient_clip_value)
+        # grad_gen_hist = [tf.clip_by_value(grad, 
+        #                                    clip_value_min=-gradient_clip_value, 
+        #                                    clip_value_max=gradient_clip_value) 
+        #                   for grad in grad_gen_hist]
+        # grad_gen_dec = [tf.clip_by_value(grad, 
+        #                                    clip_value_min=-gradient_clip_value, 
+        #                                    clip_value_max=gradient_clip_value) 
+        #                   for grad in grad_gen_dec]
+        # 
+        # Get full list of trainable variables and gradients
+        train_vars = list()
+        if image_model_trainable:
+            train_vars += ImageEncModel.trainable_variables
+        train_vars += HistEncModel.trainable_variables
+        train_vars += PathDecModel.trainable_variables
+        grad_gen_clip = list()
+        if image_model_trainable:
+            grad_gen_clip += grad_gen_img
+        grad_gen_clip += grad_gen_hist
+        grad_gen_clip += grad_gen_dec
+
+        # Apply update
+        optimizer_gen.apply_gradients(zip(grad_gen_clip, train_vars))
    
     # Log gradient norms for each model
-    out_grad_mean = list()
-    out_grad_std = list()
+    out_grad = list()
     if image_model_trainable:
-        mean_norm_grad_img, std_norm_grad_img = get_mean_and_std_norm(grad_gen_img)
-        out_grad_mean.append(mean_norm_grad_img)
-        out_grad_std.append(std_norm_grad_img)
-    mean_norm_grad_hist, std_norm_grad_hist = get_mean_and_std_norm(grad_gen_hist)
-    out_grad_mean.append(mean_norm_grad_hist)
-    out_grad_std.append(std_norm_grad_hist)
-    mean_norm_grad_dec, std_norm_grad_dec = get_mean_and_std_norm(grad_gen_dec)
-    out_grad_mean.append(mean_norm_grad_dec)
-    out_grad_std.append(std_norm_grad_dec)      
+        out_grad.append(grad_gen_img)        
+    out_grad.append(grad_gen_hist)
+    out_grad.append(grad_gen_dec)
+      
 
-    # Get full list of trainable variables and gradients
-    train_vars = list()
-    if image_model_trainable:
-        train_vars += ImageEncModel.trainable_variables
-    train_vars += HistEncModel.trainable_variables
-    train_vars += PathDecModel.trainable_variables
-    grad_gen_clip = list()
-    if image_model_trainable:
-        grad_gen_clip += grad_gen_img
-    grad_gen_clip += grad_gen_hist
-    grad_gen_clip += grad_gen_dec
-
-    # Apply update
-    optimizer_gen.apply_gradients(zip(grad_gen_clip, train_vars))
+    
 
     
     
     # Save loss
     gen_loss(tf.reduce_mean(gen_step_loss))
         
-    return gen_step_loss, out_grad_mean, out_grad_std
+    return gen_step_loss_list, out_grad
 
 
 def get_teacher_force_weight(tf_list, tf_lims, epoch, tf_weight_act, linearize=False):
@@ -289,7 +372,7 @@ def update_lr(lr_list, lr_lims, epoch, optimizer):
         K.set_value(optimizer.learning_rate, lr_new)
         print('Learning rate set to: %g'%optimizer.learning_rate.numpy())
         
-    return
+    return lr_new
 
 
 def get_future_steps_train(fs_list, fs_lims, epoch, fs_act):
@@ -323,7 +406,7 @@ def get_future_steps_train(fs_list, fs_lims, epoch, fs_act):
 ###############################################################################
 
 def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecModel, forwardpass_use,
-                   steps_validate = None, all_metrics = False, stepsInfer = -1):
+                   steps_validate = None, all_metrics = False, stepsInfer = -1, base_model = False):
     '''
     Validate the generator model using the validation dataset.
     
@@ -344,24 +427,34 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
     valLikelihood_acum = 0
     valTime_displace_acum = 0
 
+    gen_batch_size = PathDecModel.inputs[0].shape[0]
 
+    
     custom_steps = True
     val_dataset_prog_bar = tqdm(tf_validation_dataset, total=steps_validate)
     for (valSampleMapComp, valSampeHistPath, valSampeTargetPath, 
              valHistAvail, valTargetAvail, 
              valTimeStamp, valTrackID, valRasterFromAgent, valWorldFromAgent, valCentroid, valIDX) in val_dataset_prog_bar:
 
+        if gen_batch_size != None:
+            if valSampleMapComp.shape[0] < gen_batch_size:
+                break
 
         if stepsInfer == -1:
             custom_steps = False
             stepsInfer = valSampeTargetPath.shape[-2]
 
         # Predict
-        PathDecModel.reset_states()
-        HistEncModel.reset_states()
-        valPredPath = forwardpass_use(valSampleMapComp, valSampeHistPath, valHistAvail, stepsInfer, 
-                                                ImageEncModel, HistEncModel, PathDecModel,
-                                                use_teacher_force=False)
+        if base_model:
+            valPredPath = forwardpass_use(valSampleMapComp,  
+                                                    ImageEncModel,  PathDecModel,
+                                                    use_teacher_force=False)
+        else:
+            PathDecModel.reset_states()
+            HistEncModel.reset_states()
+            valPredPath = forwardpass_use(valSampleMapComp, valSampeHistPath, valHistAvail, stepsInfer, 
+                                                    ImageEncModel, HistEncModel, PathDecModel,
+                                                    use_teacher_force=False)
 
         valPredPath = valPredPath.numpy()
         # Calculate loss
@@ -376,10 +469,6 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
         if all_metrics:
             Time_displace_batch = 0
             for idx_batch in range(valPredPath.shape[0]):
-                # valLikelihood_acum += metrics.neg_multi_log_likelihood(valSampeTargetPath[idx_batch,:,:2], 
-                #                                                         np.expand_dims(valPredPath[idx_batch,:,:2], axis=0), 
-                #                                                         np.ones((1)), 
-                #                                                         valTargetAvail[idx_batch,:])
 
                 Time_displace_batch += metrics.time_displace(valSampeTargetPath[idx_batch,:stepsInfer,:2], 
                                                                         np.expand_dims(valPredPath[idx_batch,:stepsInfer,:2], axis=0), 
@@ -411,6 +500,10 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
             if idx_val > steps_validate:
                 break
 
+    if steps_validate != None:
+        if idx_val < steps_validate:
+            print('The dataset finished before the requested number of steps was reached.')
+
     if all_metrics:            
         return valLoss_acum/idx_val, valLikelihood_acum/idx_val, valTime_displace_acum/idx_val
     else:
@@ -423,25 +516,6 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
 ###############################################################################
 # ------------------------ TF DATASET READER -------------------------------- #
 ###############################################################################
-
-# def generate_scene_indexes(dataset, num_scenes=-1):
-
-#     if num_scenes < 1:
-#         num_scenes = len(dataset.dataset.scenes)
-
-#     # Scene order (incremental)
-#     scene_order = np.arange(num_scenes)
-#     # Get the indexes for each scene
-#     index_list = list()
-#     iterador = tqdm(scene_order)
-#     iterador.set_description('Generating scene idexes')
-#     for scene_idx in iterador:
-#         # get frame indexes
-#         index_list.append(dataset.get_scene_indices(scene_idx))
-
-#     return index_list
-
-
 
 def meta_dict_pass(dataset, **kwargs):
     ''' 
@@ -462,7 +536,8 @@ def meta_dict_gen(dataset,
                   randomize_scene=False, 
                   num_scenes=16000, 
                   frames_per_scene = 1,
-                  yield_only_large_distances = False):
+                  yield_only_large_distances = False,
+                  min_max_dist = 25.0):
     ''' 
     Dataset generator wrapper for TensorFlow Data compatibility 
     
@@ -476,49 +551,14 @@ def meta_dict_gen(dataset,
     frames_per_scene --- Number of frames to yield per scene (-1 means all)
     '''
 
-    desired_frames_per_scene = frames_per_scene
+    # Save the requested number of frames per scene
+    requested_frames_per_scene = frames_per_scene
 
     # Scene order (incremental)
     scene_order = np.arange(num_scenes)
     # Shuffle scene order if requested
     if randomize_scene:
         np.random.shuffle(scene_order)
-
-    
-
-    # # loop all scenes
-    # for scene_idx in scene_order:
-    #     # Frame order (incremental)
-    #     this_scene_idxs = indexes_list[scene_idx]
-    #     if this_scene_idxs.size < 1:
-    #         continue
-    #     # # Shuffle frame order if requested
-    #     # if randomize_frame:
-    #     #     np.random.shuffle(this_scene_idxs)
-        
-    #     # # Get the number of frames to yield from this scene
-    #     # if frames_per_scene > this_scene_idxs.shape[0]:
-    #     #     frames_per_scene = this_scene_idxs.shape[0]
-    #     # elif frames_per_scene<1:
-    #     #     frames_per_scene = this_scene_idxs.shape[0]
-    #     # Yield the number of requested frames of this scene
-    #     for frame_idx in range(frames_per_scene):
-    #         sample_index = this_scene_idxs[frame_idx]
-    #         sample_out = dataset[sample_index]
-            
-            
-    #         if yield_only_large_distances:
-    #             dist_max = np.sqrt(sample_out['target_positions'][np.sum(sample_out['target_availabilities']),0]**2\
-    #                               +sample_out['target_positions'][np.sum(sample_out['target_availabilities']),1]**2)
-    #             if dist_max < 25.0:
-    #                 continue
-
-    #         # add index to sample
-    #         sample_out['sample_idx'] = sample_index
-    #         yield sample_out
-
-
-
 
     # For each scene in the dataset
     for scene_idx in scene_order:
@@ -532,22 +572,22 @@ def meta_dict_gen(dataset,
             np.random.shuffle(this_scene_idxs)
         
         # Get the number of frames to yield from this scene
-        if desired_frames_per_scene > this_scene_idxs.shape[0]:
+        if requested_frames_per_scene > this_scene_idxs.shape[0]:
             frames_per_scene = this_scene_idxs.shape[0]
-        elif desired_frames_per_scene<1:
+        elif requested_frames_per_scene<1:
             frames_per_scene = this_scene_idxs.shape[0]
         else:
-            frames_per_scene = desired_frames_per_scene
+            frames_per_scene = requested_frames_per_scene
         # Yield the number of requested frames of this scene
         for frame_idx in range(frames_per_scene):
             sample_index = this_scene_idxs[frame_idx]
             sample_out = dataset[sample_index]
             
-            
+            # Filter samples with low maximum displacement if requested
             if yield_only_large_distances:
                 dist_max = np.sqrt(sample_out['target_positions'][np.sum(sample_out['target_availabilities']),0]**2\
                                   +sample_out['target_positions'][np.sum(sample_out['target_availabilities']),1]**2)
-                if dist_max < 25.0:
+                if dist_max < min_max_dist:
                     continue
 
             # add index to sample
@@ -561,7 +601,7 @@ def get_tf_dataset(dataset,
                    num_future_frames,
                    randomize_frame=False,
                    randomize_scene=False, 
-                   num_scenes=16000, 
+                   num_scenes=-1, 
                    frames_per_scene = -1,
                    meta_dict_use = meta_dict_gen):
     '''
@@ -580,6 +620,12 @@ def get_tf_dataset(dataset,
     Outputs:
     tf_dataset --- TensorFlow Dataset object.
     '''
+
+    if num_scenes < 1:
+        num_scenes = len(dataset.dataset.scenes)
+    if num_scenes > len(dataset.dataset.scenes):
+        print('Requested number of scenes (%d) exceeds the maximum, set to maximum: %d'%(num_scenes, len(dataset.dataset.scenes)))
+        num_scenes = len(dataset.dataset.scenes)
 
     print('Creating dataset with: \n\t Randomized scenes: %r\n\t Randomized frames: %r\n\t Number of scenes: %d\n\t Number of frames per scenes: %d'%(randomize_frame, randomize_scene, num_scenes, frames_per_scene))
 
@@ -656,10 +702,11 @@ def create_fade_image(input_multiCh_image, fade_factor = 0.75, update_threshold 
         sample_mask = 1.0-tf.cast((imgFade>update_threshold),tf.float32)
         
     return imgFade
-    
+
+   
 
 # Sample conformation functions (tf and numpy)
-def tf_get_input_sample(datasetSample, image_preprocess_fcn = lambda x: x):
+def tf_get_input_sample(datasetSample, image_preprocess_fcn = lambda x: x, use_fading = True):
     '''
     Tensorflow sample mapping function.
     
@@ -690,22 +737,40 @@ def tf_get_input_sample(datasetSample, image_preprocess_fcn = lambda x: x):
     sampleMap *= 255
     sampleMap = image_preprocess_fcn(sampleMap)
     
-    # Ego to fade
-    sampleEgoFade = create_fade_image(image_splits[1])
-    sampleEgoFade /= tf.reduce_max(sampleEgoFade)
-    sampleEgoFade *= 255
-    sampleEgoFade = tf.expand_dims(sampleEgoFade, axis=-1)
-    sampleEgoFade = image_preprocess_fcn(sampleEgoFade)
+    if use_fading:
+        # Ego to fade
+        sampleEgoFade = create_fade_image(image_splits[1])
+        sampleEgoFade /= tf.reduce_max(sampleEgoFade)
+        sampleEgoFade *= 255
+        sampleEgoFade = tf.expand_dims(sampleEgoFade, axis=-1)
+        sampleEgoFade = image_preprocess_fcn(sampleEgoFade)
+    else:
+        sampleEgoList = list()
+        for i in range(num_hist_frames):
+            sampleEgoList.append(image_preprocess_fcn(image_splits[1][i,:,:]))
     
-    # Agents to fade
-    sampleAgentsFade = create_fade_image(image_splits[0])
-    sampleAgentsFade /= (tf.reduce_max(sampleAgentsFade)+1e-8) # Add a low value in case no other agent is present
-    sampleAgentsFade *= 255
-    sampleAgentsFade = tf.expand_dims(sampleAgentsFade, axis=-1)
-    sampleAgentsFade = image_preprocess_fcn(sampleAgentsFade)
+    if use_fading:
+        # Agents to fade
+        sampleAgentsFade = create_fade_image(image_splits[0])
+        sampleAgentsFade /= (tf.reduce_max(sampleAgentsFade)+1e-8) # Add a low value in case no other agent is present
+        sampleAgentsFade *= 255
+        sampleAgentsFade = tf.expand_dims(sampleAgentsFade, axis=-1)
+        sampleAgentsFade = image_preprocess_fcn(sampleAgentsFade)
+    else:
+        sampleAgentsList = list()
+        for i in range(num_hist_frames):
+            sampleAgentsList.append(image_preprocess_fcn(image_splits[0][i,:,:]))
     
     # Concatenate image inputs
-    sampleMapComp = tf.concat([sampleMap, sampleEgoFade, sampleAgentsFade], axis = -1)
+    if use_fading:
+        sampleMapComp = tf.concat([sampleMap, sampleEgoFade, sampleAgentsFade], axis = -1)
+    else:
+        sampleEgoList = tf.convert_to_tensor(sampleEgoList)
+        sampleEgoList = tf.reshape(sampleEgoList, shape=(image_splits[0].shape[1], image_splits[0].shape[2], -1))
+        sampleAgentsList = tf.convert_to_tensor(sampleAgentsList)
+        sampleAgentsList = tf.reshape(sampleAgentsList, shape=(image_splits[0].shape[1], image_splits[0].shape[2], -1))
+        sampleMapComp = tf.concat([sampleMap, sampleEgoList, sampleAgentsList], axis = -1)
+        
     
     # History path
     x = datasetSample['history_positions'][:,0]#/100.0

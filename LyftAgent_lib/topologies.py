@@ -77,8 +77,8 @@ def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
         hist_outs, hist_states = HistEncModel(tf.expand_dims(hist_t[:,stepsHist-1-idx_step_hist,:], 1), training = training_state)
 
         # Clip gradients each time step!!
-        hist_outs = clip_gradients_000001(hist_outs)
-        hist_states = clip_gradients_000001(hist_states)
+        hist_outs = clip_gradients_01(hist_outs)
+        hist_states = clip_gradients_01(hist_states)
 
         hist_out_list.append(hist_outs)
         hist_hidden_list.append(hist_states)
@@ -91,10 +91,11 @@ def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
     hist_states = tf.squeeze(hist_states)
     hist_states = tf.transpose(hist_states, (1,0,2))
         
-    # Reset decoder model states to last state of HistEncModel
+    # Reset decoder model states to last state of HistEncModel # NOT WORKING; WHY????
     thisHiddenState = tf.squeeze(hist_states[:,-1,:])
-    reset_states(PathDecModel, layer_states_dict = {'gru':  thisHiddenState})
-                       
+    # reset_states(PathDecModel, layer_states_dict = {'pathRecUnit':  thisHiddenState})
+    PathDecModel.reset_states()
+                     
     # Output List
     out_list = list()
     if return_attention:
@@ -103,25 +104,29 @@ def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
 
     # Create requested path points
     nextPath = tf.squeeze(hist_t[:,0,:]) # Process current step first
+    nextPath = clip_gradients_01(nextPath)
     for idx_step in range(stepsInfer):
         
         if stop_gradient_on_prediction:
             nextPath = tf.stop_gradient(nextPath)
+            thisHiddenState = tf.stop_gradient(thisHiddenState)
 
         # Clip gradients each time step!!
-        nextPath = clip_gradients_000001(nextPath)
-        img_feats = clip_gradients_000001(img_feats)
-        hist_outs = clip_gradients_000001(hist_outs)
-        hist_states = clip_gradients_000001(hist_states)
-        thisHiddenState = clip_gradients_000001(thisHiddenState)
+        nextPath = clip_gradients_01(nextPath)
+        img_feats = clip_gradients_01(img_feats)
+        hist_outs = clip_gradients_01(hist_outs)
+        hist_states = clip_gradients_01(hist_states)
+        thisHiddenState = clip_gradients_01(thisHiddenState)
             
         # Get predicted step using decoder
         thisPath, thisHiddenState, atten_img, atten_hist = PathDecModel([nextPath,
-                                                       img_feats, 
-                                                       hist_outs, 
-                                                       hist_states, 
-                                                       thisHiddenState], training = training_state)
-        
+                                                                         img_feats, 
+                                                                         hist_outs, 
+                                                                         hist_states, 
+                                                                         thisHiddenState], training = training_state)
+
+
+        thisPath = clip_gradients_01(thisPath)
         # Add out step
         out_list.append(thisPath)
         if return_attention:
@@ -137,6 +142,7 @@ def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
             
         else:
             nextPath = thisPath
+        
         
         
         
@@ -157,7 +163,10 @@ def modelV1_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
                        use_teacher_force = False, 
                        teacher_force_weight = tf.constant(1.0), 
                        target_path=None,
-                       stop_gradient_on_prediction = False):
+                       stop_gradient_on_prediction = False,
+                       gradient_clip_thorugh_time_value = 10.0,
+                       return_attention = False,
+                       training_state=False):
     '''
     Forward pass of the path decoding model V1.
     
@@ -183,9 +192,9 @@ def modelV1_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
     out_list --- Predicted path points.
     '''
                        
-    # Reset the hidden states for this batch # BUGGED INSIDE @tf.function??
-#     PathDecModel.reset_states()
-#     HistEncModel.reset_states()
+    # Reset the hidden states for this batch 
+    PathDecModel.reset_states()
+    HistEncModel.reset_states()
     
     # Number of history states
     stepsHist = hist_t.shape[1]
@@ -195,15 +204,25 @@ def modelV1_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
         thisHiddenState = tf.zeros(PathDecModel.inputs[-1].shape)
     
     # Process input image
-    img_feats = ImageEncModel(img_t)  
+    img_feats = ImageEncModel(img_t, training = training_state)  
 
     # Process history
     for idx_step_hist in range(stepsHist-1):
-        hist_outs, hist_feats = HistEncModel(tf.expand_dims(hist_t[:,stepsHist-1-idx_step_hist,:], 1))
+        hist_outs, hist_feats = HistEncModel(tf.expand_dims(hist_t[:,stepsHist-1-idx_step_hist,:], 1), training = training_state)
         
-        # Get predicted path using decoder (to have a warm start of the hidden state)
-        thisPath, thisHiddenState = PathDecModel([img_feats, hist_outs, hist_feats, thisHiddenState])
-                       
+        hist_outs = tf.squeeze(hist_outs)
+        hist_feats = tf.squeeze(hist_feats)
+
+        # Get predicted path using decoder 
+        thisPath, thisHiddenState, _ = PathDecModel([img_feats, hist_outs, hist_feats, thisHiddenState], training = training_state)
+
+        thisPath = clip_gradients_01(thisPath)
+        thisHiddenState = clip_gradients_01(thisHiddenState)
+        hist_outs = clip_gradients_01(hist_outs)
+        hist_feats = clip_gradients_01(hist_feats)
+        
+    
+    
     # Output List
     out_list = list()
 
@@ -215,10 +234,19 @@ def modelV1_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
         nextPath = tf.expand_dims(nextPath, 1)
         if stop_gradient_on_prediction:
             nextPath = tf.stop_gradient(nextPath)
-        hist_outs, hist_feats = HistEncModel(nextPath)
+        hist_outs, hist_feats = HistEncModel(nextPath, training = training_state)
+
+        hist_outs = tf.squeeze(hist_outs)
+        hist_feats = tf.squeeze(hist_feats)
 
         # Get predicted step using decoder
-        thisPath, thisHiddenState = PathDecModel([img_feats, hist_outs, hist_feats, thisHiddenState])
+        thisPath, thisHiddenState, _ = PathDecModel([img_feats, hist_outs, hist_feats, thisHiddenState], training = training_state)
+
+        img_feats = clip_gradients_01(img_feats)
+        hist_outs = clip_gradients_01(hist_outs)
+        hist_feats = clip_gradients_01(hist_feats)
+        thisPath = clip_gradients_01(thisPath)
+        thisHiddenState = clip_gradients_01(thisHiddenState)
         
         # Add out step
         out_list.append(thisPath)
@@ -244,10 +272,65 @@ def modelV1_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
 
 
 
+@tf.function
+def modelBaseline_forward_pass(img_t, ImageEncModel, PathDecModel, training_state=False, **kwargs):
+
+    # Process input image
+    img_feats = ImageEncModel(img_t, training = training_state)  
+    # Get Path
+    out_list = PathDecModel(img_feats, training = training_state)
+
+    return out_list
+
 
 ###############################################################################
 # ------------------------ PATH PREDICTION DECODING NETS -------------------- #
 ###############################################################################
+
+
+def pathDecoderModel_Baseline(cfg, ImageEncModel):
+    '''
+    Creates a Keras model for Agent path prediction based on a convolutional network.
+    
+        
+    Arguments:
+    cfg --- Configuration.
+    ImageEncModel --- Keras image encoding model.
+        
+    Outputs:
+    PathDecModel --- Keras path decoding model.
+    '''
+
+    num_path_decode_fc_layers  = cfg["model_params"]["num_path_decode_fc_layers"]
+    path_decode_fc_units       = cfg["model_params"]["path_decode_fc_units"]
+    path_decode_fc_activation  = cfg["model_params"]["path_decode_fc_activation"]
+
+    imageProcPixelNum          = ImageEncModel.output_shape[1]
+    imageProcFeatNum           = ImageEncModel.output_shape[2]
+
+    future_num_frames = cfg["model_params"]["future_num_frames"]
+
+    Input_Image_Features = keras.Input(shape=(imageProcPixelNum, imageProcFeatNum), 
+                                        name="Input_Image_Features")
+
+    featOutT = tf.keras.layers.GlobalAveragePooling1D()(Input_Image_Features)
+
+    # Get predicted position
+    for idx_decode_layer in range(num_path_decode_fc_layers):
+        featOutT = keras.layers.Dense(path_decode_fc_units[idx_decode_layer],
+                                    activation = path_decode_fc_activation,
+                                    name='pathOutHid_%d'%idx_decode_layer)(featOutT)
+    # Last output
+    pathOut = keras.layers.Dense(future_num_frames*3,
+                                activation = None,
+                                name='pathOutLinear')(featOutT)
+
+
+    pathOut = tf.reshape(pathOut, shape=[-1, future_num_frames, 3])
+
+
+    
+    return keras.Model(Input_Image_Features, pathOut, name='Path_Decoder_Model')
 
 
 def pathDecoderModel_V2(cfg, ImageEncModel, HistEncModel):
@@ -268,86 +351,117 @@ def pathDecoderModel_V2(cfg, ImageEncModel, HistEncModel):
     PathDecModel --- Keras path decoding model.
     '''
 
-    # Get config
-    gen_batch_size             = cfg["train_data_loader"]["batch_size"]
-    histEnc_recurrent_unit_num = cfg["model_params"]["history_encoder_recurrent_units_number"]
-    pathDec_recurrent_unit     = cfg["model_params"]["path_generation_decoder_recurrent_unit"]
-    pathDec_recurrent_unit_num = cfg["model_params"]["path_generation_decoder_recurrent_units_number"]
-    pathDec_attention_pr_units = cfg["model_params"]["pathDec_attention_pr_units"]
-    num_path_decode_fc_layers  = cfg["model_params"]["num_path_decode_fc_layers"]
-    path_decode_fc_units       = cfg["model_params"]["path_decode_fc_units"]
-    path_decode_fc_activation  = cfg["model_params"]["path_decode_fc_activation"]
-    increment_net              = cfg["model_params"]["increment_net"]
-    path_noise_level           = cfg["model_params"]["path_noise_level"]
+    with tf.name_scope("PathDecodingModel"):
+        # Get config
+        gen_batch_size             = cfg["train_data_loader"]["batch_size"]
+        histEnc_recurrent_unit_num = cfg["model_params"]["history_encoder_recurrent_units_number"]
+        pathDec_recurrent_unit     = cfg["model_params"]["path_generation_decoder_recurrent_unit"]
+        pathDec_recurrent_unit_num = cfg["model_params"]["path_generation_decoder_recurrent_units_number"]
+        pathDec_attention_pr_units = cfg["model_params"]["pathDec_attention_pr_units"]
+        num_path_decode_fc_layers  = cfg["model_params"]["num_path_decode_fc_layers"]
+        path_decode_fc_units       = cfg["model_params"]["path_decode_fc_units"]
+        path_decode_fc_activation  = cfg["model_params"]["path_decode_fc_activation"]
+        increment_net              = cfg["model_params"]["increment_net"]
+        path_noise_level           = cfg["model_params"]["path_noise_level"]
 
-    imageProcPixelNum          = ImageEncModel.output_shape[1]
-    imageProcFeatNum           = ImageEncModel.output_shape[2]
-    
-    # Inputs
-    Input_Image_Features = keras.Input(batch_shape=(gen_batch_size, imageProcPixelNum, imageProcFeatNum), 
-                                       name="Input_Image_Features")
-    Input_History_Hidden = keras.Input(batch_shape=(gen_batch_size, None, histEnc_recurrent_unit_num), 
-                                         name="Input_History_Hidden")
-    Input_History_Out = keras.Input(batch_shape=(gen_batch_size, None, histEnc_recurrent_unit_num), 
-                                         name="Input_History_Out")
-    Input_Last_Hidden_State = keras.Input(batch_shape=(gen_batch_size, pathDec_recurrent_unit_num), 
-                                         name="Input_Last_Hidden_State")
-    Input_position = keras.Input(batch_shape=(gen_batch_size, 3), name="Input_position")
+        pathDec_use_attention_hist = cfg["model_params"]["pathDec_use_attention_hist"]
+        pathDec_use_attention_img  = cfg["model_params"]["pathDec_use_attention_img"]
 
-    # Add noise
-    in_position = tf.keras.layers.GaussianNoise(path_noise_level)(Input_position)
+        imageProcPixelNum          = ImageEncModel.output_shape[1]
+        imageProcFeatNum           = ImageEncModel.output_shape[2]
+        
+        # Inputs
+        Input_Image_Features = keras.Input(batch_shape=(gen_batch_size, imageProcPixelNum, imageProcFeatNum), 
+                                        name="Input_Image_Features")
+        Input_History_Hidden = keras.Input(batch_shape=(gen_batch_size, None, histEnc_recurrent_unit_num), 
+                                            name="Input_History_Hidden")
+        Input_History_Out = keras.Input(batch_shape=(gen_batch_size, None, histEnc_recurrent_unit_num), 
+                                            name="Input_History_Out")
+        Input_Last_Hidden_State = keras.Input(batch_shape=(gen_batch_size, pathDec_recurrent_unit_num), 
+                                            name="Input_Last_Hidden_State")
+        Input_position = keras.Input(batch_shape=(gen_batch_size, 3), name="Input_position")
 
-    # Set attention mechanism for image
-    imageAttnFeatT, attenScores_image = BahdanauAttention(pathDec_attention_pr_units)([Input_Last_Hidden_State, Input_Image_Features])
-    # Set attention mechanism for history
-    histAttnFeatT, attenScores_history = BahdanauAttention(pathDec_attention_pr_units)([Input_Last_Hidden_State, Input_History_Out])
+        # Add noise
+        in_position = tf.keras.layers.GaussianNoise(path_noise_level)(Input_position)
+
+        if pathDec_use_attention_img:
+            with tf.name_scope("ImageAttention"):
+                # Set attention mechanism for image
+                imageAttnFeatT, attenScores_image = BahdanauAttention(pathDec_attention_pr_units, 
+                                                                    name='BahdanauImageAttention')([Input_Last_Hidden_State,
+                                                                                                    Input_Image_Features])
+
+                # Project the physical attention to a lower space (matching path history encoding)
+                imageAttnFeatT = keras.layers.Dense(histEnc_recurrent_unit_num,
+                                                    kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
+                                                    activation=keras.layers.LeakyReLU(alpha=0.1),
+                                                    name='imgAttnProjection')(imageAttnFeatT)
+        else:
+            with tf.name_scope("ImagePooling"):  
+                imageAttnFeatT = tf.keras.layers.GlobalAveragePooling1D()(Input_Image_Features)
+                attenScores_image = tf.ones_like(imageAttnFeatT)
+
+        if pathDec_use_attention_img:
+            with tf.name_scope("HistoryAttention"):            
+                # Set attention mechanism for history
+                histAttnFeatT, attenScores_history = BahdanauAttention(pathDec_attention_pr_units,
+                                                                    name='BahdanauHistoryAttention')([Input_Last_Hidden_State, 
+                                                                                                        Input_History_Out])
+        else:
+            with tf.name_scope("HistoryPooling"):  
+                histAttnFeatT = tf.keras.layers.GlobalAveragePooling1D()(Input_History_Out)
+                attenScores_history = tf.ones_like(histAttnFeatT)
 
 
-    # Project the physical attention to a lower space (matching path history encoding)
-    imageAttnFeatT = keras.layers.Dense(histEnc_recurrent_unit_num,
-                                        kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
-                                        activation=keras.layers.LeakyReLU(alpha=0.1))(imageAttnFeatT)
+            
 
-    # Concatenate feature tensors with current position
-    featT = keras.layers.Concatenate(axis=-1)([imageAttnFeatT, histAttnFeatT, in_position])
+        with tf.name_scope("PathGeneration"):            
+            # Concatenate feature tensors with current position
+            featT = keras.layers.Concatenate(axis=-1, name='pathFeatConcat')([imageAttnFeatT, histAttnFeatT, in_position])
 
 
-    # Get recurrent unit to use
-    try:
-        pathDec_base_recurrent_unit = getattr(keras.layers, pathDec_recurrent_unit)
-    except:
-        raise Exception('Path decoder base recurrent unit not found. Requested unit: %s'%pathDec_recurrent_unit)
+            # Get recurrent unit to use
+            try:
+                pathDec_base_recurrent_unit = getattr(keras.layers, pathDec_recurrent_unit)
+            except:
+                raise Exception('Path decoder base recurrent unit not found. Requested unit: %s'%pathDec_recurrent_unit)
 
-    # Apply recurrent output
-    featT = K.expand_dims(featT, 1)
-    featOutT, featHidT  = pathDec_base_recurrent_unit(pathDec_recurrent_unit_num,
-                                                        kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
-                                                        recurrent_regularizer=keras.regularizers.l1_l2(0.01,0.01),
-                                                        # bias_regularizer=keras.regularizers.l2(0.001),
-                                                      stateful=True,
-                                                      return_state=True)(featT)
+            # Apply recurrent output
+            featT = K.expand_dims(featT, 1)
+            rec_outs = pathDec_base_recurrent_unit(pathDec_recurrent_unit_num,
+                                                                kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
+                                                                recurrent_regularizer=keras.regularizers.l1_l2(0.01,0.01),
+                                                                # bias_regularizer=keras.regularizers.l2(0.001),
+                                                            stateful=True,
+                                                            return_state=True,
+                                                            name='pathRecUnit')(featT)
 
-    # Get predicted position
-    for idx_decode_layer in range(num_path_decode_fc_layers):
-        featOutT = keras.layers.Dense(path_decode_fc_units[idx_decode_layer],
-                                      kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
-                                      activation = path_decode_fc_activation)(featOutT)
-    # Last output
-    pathOut = keras.layers.Dense(3,
-                                kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
-                                activation = None)(featOutT)
+            featOutT = rec_outs[0]
+            featHidT = rec_outs[-1]
 
-    if increment_net:
-        pathOut += Input_position
+            # Get predicted position
+            for idx_decode_layer in range(num_path_decode_fc_layers):
+                featOutT = keras.layers.Dense(path_decode_fc_units[idx_decode_layer],
+                                            kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
+                                            activation = path_decode_fc_activation,
+                                            name='pathOutHid_%d'%idx_decode_layer)(featOutT)
+            # Last output
+            pathOut = keras.layers.Dense(3,
+                                        # kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
+                                        activation = None,
+                                        name='pathOutLinear')(featOutT)
 
-    # Create model
-    return keras.Model([Input_position,
-                        Input_Image_Features,
-                        Input_History_Out, 
-                        Input_History_Hidden, 
-                        Input_Last_Hidden_State],
-                       [pathOut, featHidT, attenScores_image, attenScores_history],
-                       name='Path_Decoder_Model')
+            if increment_net:
+                pathOut += Input_position
+
+        # Create model
+        return keras.Model([Input_position,
+                            Input_Image_Features,
+                            Input_History_Out, 
+                            Input_History_Hidden, 
+                            Input_Last_Hidden_State],
+                        [pathOut, featHidT, attenScores_image, attenScores_history],
+                        name='Path_Decoder_Model')
 
 
 def pathDecoderModel_V1(cfg, ImageEncModel, HistEncModel):
@@ -391,56 +505,55 @@ def pathDecoderModel_V1(cfg, ImageEncModel, HistEncModel):
                                          name="Input_Last_Hidden_State")
 
 
-    histAttenFeatT = Input_History_Features
     # Set attention mechanism for image
-    # Image_query = keras.layers.Concatenate(axis=-1)([Input_History_Features, Input_Last_Hidden_State])
-    Image_query = Input_Last_Hidden_State
+    with tf.name_scope("ImageAttention"):
+        Image_query = Input_Last_Hidden_State
+        imageAttenFeatT, attenScores = BahdanauAttention(pathDec_attention_pr_units,
+                                                         name='BahdanauImageAttention')([Image_query, Input_Image_Features])
 
-    # img_att_q = keras.layers.Dense(imageProcFeatNum)(Input_Last_Hidden_State)
-    # img_att_q = K.reshape(img_att_q, shape=[-1, 1, img_att_q.shape[1]])
-    # imageAttenFeatT = tf.keras.layers.AdditiveAttention(causal = False)([img_att_q, Input_Image_Features])
-    # imageAttenFeatT = K.reshape(imageAttenFeatT, shape=[-1, imageProcFeatNum])
+    with tf.name_scope("PathGeneration"): 
+        # Project the physical attention to a lower space (matching path history encoding)
+        # imageAttenFeatT = keras.layers.Dense(histEnc_recurrent_unit_num,
+        #                                      activation=keras.layers.LeakyReLU(alpha=0.1))(imageAttenFeatT)
 
-    # imageAttenFeatT, attenScores = BahdanauAttention(pathDec_attention_pr_units)([Input_Last_Hidden_State, Input_Image_Features])
-    imageAttenFeatT, attenScores = BahdanauAttention(pathDec_attention_pr_units)([Image_query, Input_Image_Features])
-
-
-
-    # Project the physical attention to a lower space (matching path history encoding)
-    imageAttenFeatT = keras.layers.Dense(histEnc_recurrent_unit_num,
-                                         activation=keras.layers.LeakyReLU(alpha=0.1))(imageAttenFeatT)
-
-    # Concatenate feature tensors
-    # featT = keras.layers.Concatenate(axis=-1)([imageAttenFeatT, histAttenFeatT])
-    featT = keras.layers.Concatenate(axis=-1)([imageAttenFeatT, Input_History_Out])
+        # Concatenate feature tensors
+        # featT = keras.layers.Concatenate(axis=-1)([imageAttenFeatT, histAttenFeatT])
+        featT = keras.layers.Concatenate(axis=-1)([imageAttenFeatT, Input_History_Out])
 
 
-    # Get recurrent unit to use
-    try:
-        pathDec_base_recurrent_unit = getattr(keras.layers, pathDec_recurrent_unit)
-    except:
-        raise Exception('Path decoder base recurrent unit not found. Requested unit: %s'%pathDec_recurrent_unit)
+        # Get recurrent unit to use
+        try:
+            pathDec_base_recurrent_unit = getattr(keras.layers, pathDec_recurrent_unit)
+        except:
+            raise Exception('Path decoder base recurrent unit not found. Requested unit: %s'%pathDec_recurrent_unit)
 
-    # Apply recurrent output
-    featT = K.expand_dims(featT, 1)
-    featOutT, featHidT  = pathDec_base_recurrent_unit(pathDec_recurrent_unit_num,
-                                                      stateful=True,
-                                                      return_state=True)(featT)
+        # Apply recurrent output
+        featT = K.expand_dims(featT, 1)
+        featOutT, featHidT  = pathDec_base_recurrent_unit(pathDec_recurrent_unit_num,
+                                                          kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
+                                                          recurrent_regularizer=keras.regularizers.l1_l2(0.01,0.01),
+                                                          stateful=True,
+                                                          return_state=True,
+                                                          name='pathRecUnit')(featT)
 
-    # Get predicted position
-    for idx_decode_layer in range(num_path_decode_fc_layers):
-        featOutT = keras.layers.Dense(path_decode_fc_units[idx_decode_layer],
-                                      activation = path_decode_fc_activation)(featOutT)
-    # Last output
-    pathOut = keras.layers.Dense(3,
-                                activation = None)(featOutT)
+        # Get predicted position
+        for idx_decode_layer in range(num_path_decode_fc_layers):
+            featOutT = keras.layers.Dense(path_decode_fc_units[idx_decode_layer],
+                                          kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
+                                          activation = path_decode_fc_activation,
+                                          name='pathOutHid_%d'%idx_decode_layer)(featOutT)
+        # Last output
+        pathOut = keras.layers.Dense(3,
+                                    activation = None,
+                                    name='pathOutLinear')(featOutT)
+
 
     # Create model
     return keras.Model([Input_Image_Features,
                         Input_History_Out, 
                         Input_History_Features, 
                         Input_Last_Hidden_State],
-                       [pathOut, featHidT],
+                       [pathOut, featHidT, attenScores],
                        name='Path_Decoder_Model')
 
 
@@ -451,7 +564,7 @@ def pathDecoderModel_V1(cfg, ImageEncModel, HistEncModel):
 # ------------------------ PATH HISTORY ENCODING NET ------------------------ #
 ###############################################################################
 
-def pathEncodingModel(cfg, return_sequences=False, CarNet = False):
+def pathEncodingModel(cfg, return_sequences=False):
     '''
     Creates a Keras model for Agent history encoding based on a given recurrent unit.
     
@@ -463,56 +576,62 @@ def pathEncodingModel(cfg, return_sequences=False, CarNet = False):
     Outputs:
     HistEncModel --- Keras path history encoding model.
     '''
+    with tf.name_scope("HistoryEncodingModel"):
+        # Get config
+        gen_batch_size             = cfg["train_data_loader"]["batch_size"]
+        histEnc_recurrent_unit     = cfg["model_params"]["history_encoder_recurrent_unit"]
+        histEnc_recurrent_unit_num = cfg["model_params"]["history_encoder_recurrent_units_number"]
+        num_hist_encode_layers     = cfg["model_params"]["num_hist_encode_layers"]
+        hist_encode_units          = cfg["model_params"]["hist_encode_units"]
+        path_noise_level           = cfg["model_params"]["path_noise_level"]
+        # hist_encode_activation     = cfg["model_params"]["hist_encode_activation"]
+        hist_encode_activation     = keras.layers.LeakyReLU(alpha=0.1)
 
-    # Get config
-    gen_batch_size             = cfg["train_data_loader"]["batch_size"]
-    histEnc_recurrent_unit     = cfg["model_params"]["history_encoder_recurrent_unit"]
-    histEnc_recurrent_unit_num = cfg["model_params"]["history_encoder_recurrent_units_number"]
-    num_hist_encode_layers     = cfg["model_params"]["num_hist_encode_layers"]
-    hist_encode_units          = cfg["model_params"]["hist_encode_units"]
-    path_noise_level           = cfg["model_params"]["path_noise_level"]
-    # hist_encode_activation     = cfg["model_params"]["hist_encode_activation"]
-    hist_encode_activation     = keras.layers.LeakyReLU(alpha=0.1)
+        CarNet                     = cfg["model_params"]["CarNet"]
 
-    # Inputs
-    Input_hist_frames = keras.Input(batch_shape=(gen_batch_size, 1, 3), 
-                                    name="Input_history_frames")
+        # Inputs
+        Input_hist_frames = keras.Input(batch_shape=(gen_batch_size, 1, 3), 
+                                        name="Input_history_frames")
 
-    # Add noise
-    pathFeatT = tf.keras.layers.GaussianNoise(path_noise_level)(Input_hist_frames)
+        # Add noise
+        pathFeatT = tf.keras.layers.GaussianNoise(path_noise_level)(Input_hist_frames)
 
-    # History encoding dense layers
-    for idx_encode_layer in range(num_hist_encode_layers):
-        pathFeatT = keras.layers.Dense(hist_encode_units[idx_encode_layer],
-                                       kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
-                                       activation=hist_encode_activation)(pathFeatT)
+        # History encoding dense layers
+        for idx_encode_layer in range(num_hist_encode_layers):
+            pathFeatT = keras.layers.Dense(hist_encode_units[idx_encode_layer],
+                                        kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
+                                        activation=hist_encode_activation)(pathFeatT)
 
-    if not CarNet:
-        # Get recurrent unit to use
-        try:
-            histEnc_base_recurrent_unit = getattr(keras.layers, histEnc_recurrent_unit)
-        except:
-            raise Exception('History encoder base recurrent unit not found. Requested unit: %s'%histEnc_recurrent_unit)
-    
-        # Recurrent encoding
-        outs  = histEnc_base_recurrent_unit(histEnc_recurrent_unit_num,
-                                            kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
-                                            recurrent_regularizer=keras.regularizers.l1_l2(0.01,0.01),
-                                            # bias_regularizer=keras.regularizers.l2(0.001),
-                                            return_state=True,
-                                            return_sequences=return_sequences,
-                                            stateful=True)(pathFeatT)
-        # Get output and states
-        encoder_out = outs[0]
-        encoder_states = outs[1:]
-    else:
-        # Return the encoding of the input coordinates
-        encoder_out = pathFeatT
-        encoder_states = pathFeatT
+        if not CarNet:
+            # Get recurrent unit to use
+            try:
+                histEnc_base_recurrent_unit = getattr(keras.layers, histEnc_recurrent_unit)
+            except:
+                raise Exception('History encoder base recurrent unit not found. Requested unit: %s'%histEnc_recurrent_unit)
+        
+            # Recurrent encoding
+            outs  = histEnc_base_recurrent_unit(histEnc_recurrent_unit_num,
+                                                kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
+                                                recurrent_regularizer=keras.regularizers.l1_l2(0.01,0.01),
+                                                # bias_regularizer=keras.regularizers.l2(0.001),
+                                                return_state=True,
+                                                return_sequences=return_sequences,
+                                                stateful=True,
+                                                name='histRecUnit')(pathFeatT)
+            # Get output and states
+            encoder_out = outs[0]
+            encoder_states = outs[-1]
+        else:
+            pathFeatT = keras.layers.Dense(histEnc_recurrent_unit_num,
+                                        activation=hist_encode_activation)(pathFeatT)
 
-    
+            # Return the encoding of the input coordinates
+            encoder_out = pathFeatT
+            encoder_states = pathFeatT
 
-    return keras.Model(Input_hist_frames, [encoder_out, encoder_states], name='History_Encoding_Model')
+        
+
+        return keras.Model(Input_hist_frames, [encoder_out, encoder_states], name='History_Encoding_Model')
 
 
 ###############################################################################
@@ -534,17 +653,25 @@ def imageEncodingModel(base_img_model, cfg):
     
     # Get config
     model_map_input_shape      = (cfg["raster_params"]["raster_size"][0],
-                                  cfg["raster_params"]["raster_size"][1])
+                                cfg["raster_params"]["raster_size"][1])
     retrain_inputs_image_model = cfg["training_params"]["retrain_inputs_image_model"]
-    retrain_all_image_model = cfg["training_params"]["retrain_all_image_model"]
+    retrain_all_image_model    = cfg["training_params"]["retrain_all_image_model"]
+
+    history_num_frames         = cfg["model_params"]["history_num_frames"]
+    use_fading                 = cfg["model_params"]["use_fading"]
+
     retrain_inputs_image_model = retrain_all_image_model or retrain_inputs_image_model
-    map_input_channels         = 3+2 # RGB + Ego Fade + Agent Fade
-   
+
+    if use_fading:
+        map_input_channels         = 3+2 # RGB + Ego Fade + Agent Fade
+    else:
+        map_input_channels         = 3+(history_num_frames*2)+2 
     # Inputs
     Input_map = keras.Input(shape=(model_map_input_shape[0],
-                                       model_map_input_shape[1], 
-                                       map_input_channels), 
+                                    model_map_input_shape[1], 
+                                    map_input_channels), 
                                 name="Input_map")
+    
     mapT = Input_map
 
     # Redefine input layer of base image model (for multiple channel compatibility)
@@ -555,85 +682,94 @@ def imageEncodingModel(base_img_model, cfg):
         idx_layer_start += 1
         layer_start = base_img_model.layers[idx_layer_start]
 
-    # Create a new layer with the same characteristics
-    newConv = keras.layers.Conv2D(layer_start.filters,
-                                  layer_start.kernel_size,
-                                  strides=layer_start.strides,
-                                  padding=layer_start.padding,
-                                  data_format=layer_start.data_format,
-                                  dilation_rate=layer_start.dilation_rate,
-                                  activation=layer_start.activation,
-                                  use_bias=layer_start.use_bias,
-                                  kernel_initializer=layer_start.kernel_initializer,
-                                  bias_initializer=layer_start.bias_initializer,
-                                  kernel_regularizer=layer_start.kernel_regularizer,
-                                  bias_regularizer=layer_start.bias_regularizer,
-                                  activity_regularizer=layer_start.activity_regularizer,
-                                  kernel_constraint=layer_start.kernel_constraint,
-                                  bias_constraint=layer_start.bias_constraint,
-                                  trainable = retrain_inputs_image_model)
+    
+           
+    with tf.name_scope("ComposedInputLayer"):
 
-    mapT = newConv(mapT)
+        # Create a new layer with the same characteristics
+        newConv = keras.layers.Conv2D(layer_start.filters,
+                                    layer_start.kernel_size,
+                                    strides=layer_start.strides,
+                                    padding=layer_start.padding,
+                                    data_format=layer_start.data_format,
+                                    dilation_rate=layer_start.dilation_rate,
+                                    activation=layer_start.activation,
+                                    use_bias=layer_start.use_bias,
+                                    kernel_initializer=layer_start.kernel_initializer,
+                                    bias_initializer=layer_start.bias_initializer,
+                                    kernel_regularizer=layer_start.kernel_regularizer,
+                                    bias_regularizer=layer_start.bias_regularizer,
+                                    activity_regularizer=layer_start.activity_regularizer,
+                                    kernel_constraint=layer_start.kernel_constraint,
+                                    bias_constraint=layer_start.bias_constraint,
+                                    trainable = retrain_inputs_image_model)
 
-    # Set RGB filter channels to the pretrained values
-    # For the new channels we will copy the red channel 
-    # (most important for human vision, maybe also in this net?, nevertheless we will retrain them...)
-    this_weights = layer_start.get_weights()
-    new_weights = np.zeros((layer_start.kernel_size[0], layer_start.kernel_size[1], map_input_channels, layer_start.filters))
-    new_weights[:,:,:3,:] = this_weights[0]
-    for idx_newChn in range(map_input_channels-this_weights[0].shape[2]):
-        new_weights[:,:,this_weights[0].shape[2]+idx_newChn,:] = this_weights[0][:,:,0,:]
+        mapT = newConv(mapT)
 
-    newConv.set_weights([new_weights])
-
-
-
-    # Add the rest of the base image processing model, loading its weights...
-    # Since the model is not sequential, this will be a complex process.
-    # For each layer added we need to track its name and save the node for future connections.
-    bim_layers = dict()
-    bim_layers[layer_start.name] = mapT
-    for idx_layer, this_layer in enumerate(base_img_model.layers):
-
-        # Before input convolution
-        if idx_layer <= idx_layer_start:
-            continue 
-
-        # Get name of predecessor layers
-        int_node = this_layer._inbound_nodes[0]
-        if type(int_node.inbound_layers) is list:
-            prev_layers_names = [auxLayer.name for auxLayer in int_node.inbound_layers]
-            layer_input_list = [bim_layers.get(key) for key in prev_layers_names]
+        # Set RGB filter channels to the pretrained values
+        # For the new channels we will copy the red channel 
+        # (most important for human vision, maybe also in this net?, nevertheless we will retrain them if we want...)
+        this_weights = layer_start.get_weights()
+        new_weights = np.zeros((layer_start.kernel_size[0], layer_start.kernel_size[1], map_input_channels, layer_start.filters))
+        new_weights[:,:,:3,:] = this_weights[0]
+        for idx_newChn in range(map_input_channels-this_weights[0].shape[2]):
+            new_weights[:,:,this_weights[0].shape[2]+idx_newChn,:] = this_weights[0][:,:,0,:]
+        # bias
+        if len(this_weights) > 1:
+            new_bias = this_weights[1]
+            new_weights = [new_weights, new_bias]
         else:
-            prev_layers_names = int_node.inbound_layers.name
-            layer_input_list = bim_layers.get(prev_layers_names)
+            new_weights = [new_weights]
+    
+        newConv.set_weights(new_weights)
 
-        # Get layer configuration
-        this_config = this_layer.get_config()
-        this_weights = this_layer.get_weights()
-        # Freeze the layer weights
-        this_config['trainable'] = retrain_all_image_model
-        # Duplicate layer
-        append_layer = this_layer.from_config(this_config)
-        # Connect to all inbound layers   
-        mapT = append_layer(layer_input_list)
-        # Reload pretrained weights
-        append_layer.set_weights(this_weights)
+    with tf.name_scope("BaseNetLayers"):
+        # Add the rest of the base image processing model, loading its weights...
+        # Since the model is not sequential, this will be a complex process.
+        # For each layer added we need to track its name and save the node for future connections.
+        bim_layers = dict()
+        bim_layers[layer_start.name] = mapT
+        for idx_layer, this_layer in enumerate(base_img_model.layers):
+
+            # Before input convolution
+            if idx_layer <= idx_layer_start:
+                continue 
+
+            # Get name of predecessor layers
+            int_node = this_layer._inbound_nodes[0]
+            if type(int_node.inbound_layers) is list:
+                prev_layers_names = [auxLayer.name for auxLayer in int_node.inbound_layers]
+                layer_input_list = [bim_layers.get(key) for key in prev_layers_names]
+            else:
+                prev_layers_names = int_node.inbound_layers.name
+                layer_input_list = bim_layers.get(prev_layers_names)
+
+            # Get layer configuration
+            this_config = this_layer.get_config()
+            this_weights = this_layer.get_weights()
+            # Freeze the layer weights
+            this_config['trainable'] = retrain_all_image_model
+            # Duplicate layer
+            append_layer = this_layer.from_config(this_config)
+            # Connect to all inbound layers   
+            mapT = append_layer(layer_input_list)
+            # Reload pretrained weights
+            append_layer.set_weights(this_weights)
 
 
 
 
-        # Save layer info
-        bim_layers[this_layer.name] = mapT
+            # Save layer info
+            bim_layers[this_layer.name] = mapT
 
-
-    # Flatten to feature tensor 
-    # mapFeatT = keras.layers.Flatten()(mapT)
-    # Reshape feature map
-    mapFeatT = K.reshape(mapT, shape=[-1,mapT.shape[1]*mapT.shape[2],mapT.shape[3]])
+    with tf.name_scope("OutputLayers"):
+        # Flatten to feature tensor 
+        # mapFeatT = keras.layers.Flatten()(mapT)
+        # Reshape feature map
+        mapFeatT = K.reshape(mapT, shape=[-1,mapT.shape[1]*mapT.shape[2],mapT.shape[3]])
 
     return keras.Model(Input_map, mapFeatT, name='Image_Encodding_Model')
-    
+
     
 
 
@@ -647,16 +783,16 @@ def imageEncodingModel(base_img_model, cfg):
 
 # Custom gradient clip for RNN
 @tf.custom_gradient
-def clip_gradients_00001(y):
+def clip_gradients_01(y):
     def backward(dy):
-        return tf.clip_by_norm(dy, 0.1)
+        return tf.clip_by_norm(dy, 0.01)
         # return tf.clip_by_value(dy, clip_value_max=0.01, clip_value_min=-0.01)
     return y, backward
 
 @tf.custom_gradient
 def clip_gradients_000001(y):
     def backward(dy):
-        return tf.clip_by_norm(dy, 0.1)
+        return tf.clip_by_norm(dy, 0.0000000000000000)
         # return tf.clip_by_value(dy, clip_value_max=0.001, clip_value_min=-0.001)
     return y, backward
 
@@ -667,9 +803,9 @@ class BahdanauAttention(tf.keras.layers.Layer):
     def __init__(self, units, **kwargs):
         super(BahdanauAttention, self).__init__()
         self.units = units
-        self.W1 = tf.keras.layers.Dense(self.units)
-        self.W2 = tf.keras.layers.Dense(self.units)
-        self.V = tf.keras.layers.Dense(1)
+        self.W1 = tf.keras.layers.Dense(self.units, use_bias=False, name='W1')
+        self.W2 = tf.keras.layers.Dense(self.units, use_bias=False, name='W2')
+        self.V = tf.keras.layers.Dense(1, use_bias=False, name='V')
 
     def call(self, x):
         
