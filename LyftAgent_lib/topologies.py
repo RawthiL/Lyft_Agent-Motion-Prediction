@@ -17,6 +17,19 @@ import tensorflow.keras.backend as K
 # ------------------------ COMPOUND MODEL FORWARD PASS ---------------------- #
 ###############################################################################
 
+def compute_mruv_path(vel, accel, stepsInfer, clip_low_lims = [0.0, -80.0], clip_high_lims = [200.0, 80.0]):
+
+    mruv_path = list()
+    for idx_step in range(0, stepsInfer+1):
+        this_mruv_pos = (idx_step*vel) + (accel*idx_step*idx_step/2.0)
+        this_mruv_pos = tf.clip_by_value(this_mruv_pos, clip_low_lims, clip_high_lims)
+        mruv_path.append(this_mruv_pos) 
+    mruv_path = tf.convert_to_tensor(mruv_path)
+    mruv_path = tf.transpose(mruv_path, (1,0,2))
+
+    return mruv_path
+
+
 @tf.function
 def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, HistEncModel, PathDecModel,
                         thisHiddenState = None,
@@ -26,7 +39,12 @@ def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
                        stop_gradient_on_prediction = False,
                        gradient_clip_thorugh_time_value = 10.0,
                        return_attention = False,
-                       training_state=False):
+                       training_state = False,
+                       increment_net = False,
+                       mruv_guiding = False,
+                       mruv_weight = 0.1,
+                       mruv_model = None,
+                       mruv_model_trainable = False):
     '''
     Forward pass of the path decoding model V2.
     
@@ -90,11 +108,21 @@ def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
     hist_outs = tf.transpose(hist_outs, (1,0,2))
     hist_states = tf.squeeze(hist_states)
     hist_states = tf.transpose(hist_states, (1,0,2))
+
+    # Get uniform movement data
+    if mruv_guiding:
+        if mruv_model_trainable:
+            mruv_v, mruv_a, mruv_confidence = mruv_model(hist_outs[:,-1,:], training = training_state)
+        else:
+            mruv_v, mruv_a, mruv_confidence = mruv_model(hist_t)
+        # Compute future steps
+        mruv_path = compute_mruv_path(mruv_v, mruv_a, stepsInfer)
         
     # Reset decoder model states to last state of HistEncModel # NOT WORKING; WHY????
     thisHiddenState = tf.squeeze(hist_states[:,-1,:])
     # reset_states(PathDecModel, layer_states_dict = {'pathRecUnit':  thisHiddenState})
     PathDecModel.reset_states()
+
                      
     # Output List
     out_list = list()
@@ -105,6 +133,7 @@ def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
     # Create requested path points
     nextPath = tf.squeeze(hist_t[:,0,:]) # Process current step first
     nextPath = clip_gradients_01(nextPath)
+    prev_path = hist_t[:,1,:]
     for idx_step in range(stepsInfer):
         
         if stop_gradient_on_prediction:
@@ -117,18 +146,35 @@ def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
         hist_outs = clip_gradients_01(hist_outs)
         hist_states = clip_gradients_01(hist_states)
         thisHiddenState = clip_gradients_01(thisHiddenState)
+
+        if increment_net:
+            inPath = nextPath-prev_path
+        else: 
+            inPath = nextPath
+
+        input_list = [inPath, img_feats, hist_outs, hist_states, thisHiddenState]
+        if mruv_guiding:
+            if increment_net:
+                mruvInPath = mruv_path[:,idx_step+1,:]-mruv_path[:,idx_step,:]
+            else: 
+                mruvInPath = mruv_path[:,idx_step+1,:]
+            input_list.append(tf.stop_gradient(mruvInPath))
+            input_list.append(tf.stop_gradient(mruv_confidence))
             
         # Get predicted step using decoder
-        thisPath, thisHiddenState, atten_img, atten_hist = PathDecModel([nextPath,
-                                                                         img_feats, 
-                                                                         hist_outs, 
-                                                                         hist_states, 
-                                                                         thisHiddenState], training = training_state)
+        stepPath, thisHiddenState, atten_img, atten_hist = PathDecModel(input_list, training = training_state)
 
 
-        thisPath = clip_gradients_01(thisPath)
+        stepPath = clip_gradients_01(stepPath)
+
+        if increment_net:
+            thisPath = nextPath+stepPath
+        else:
+            thisPath = stepPath
+
         # Add out step
         out_list.append(thisPath)
+
         if return_attention:
             out_img_attention.append(atten_img)
             out_hist_attention.append(atten_hist)
@@ -139,7 +185,6 @@ def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
             # real and generated path
             delta_path = (thisPath-target_path[:,idx_step,:])
             nextPath = target_path[:,idx_step,:] + (1.0-teacher_force_weight)*delta_path
-            
         else:
             nextPath = thisPath
         
@@ -153,6 +198,8 @@ def modelV2_forward_pass(img_t, hist_t, histAvail, stepsInfer, ImageEncModel, Hi
     
     if return_attention:
         return out_list, out_img_attention, out_hist_attention
+    elif mruv_guiding and training_state:
+        return out_list, mruv_v, mruv_a, mruv_confidence    
     else:
         return out_list
 
@@ -304,11 +351,19 @@ def pathDecoderModel_Baseline(cfg, ImageEncModel):
     num_path_decode_fc_layers  = cfg["model_params"]["num_path_decode_fc_layers"]
     path_decode_fc_units       = cfg["model_params"]["path_decode_fc_units"]
     path_decode_fc_activation  = cfg["model_params"]["path_decode_fc_activation"]
+    use_angle                  = cfg["model_params"]["use_angle"]
+
+    if use_angle:
+        num_outs = 3
+    else:
+        num_outs = 2
 
     imageProcPixelNum          = ImageEncModel.output_shape[1]
     imageProcFeatNum           = ImageEncModel.output_shape[2]
 
     future_num_frames = cfg["model_params"]["future_num_frames"]
+
+    
 
     Input_Image_Features = keras.Input(shape=(imageProcPixelNum, imageProcFeatNum), 
                                         name="Input_Image_Features")
@@ -326,7 +381,7 @@ def pathDecoderModel_Baseline(cfg, ImageEncModel):
                                 name='pathOutLinear')(featOutT)
 
 
-    pathOut = tf.reshape(pathOut, shape=[-1, future_num_frames, 3])
+    pathOut = tf.reshape(pathOut, shape=[-1, future_num_frames, num_outs])
 
 
     
@@ -361,11 +416,19 @@ def pathDecoderModel_V2(cfg, ImageEncModel, HistEncModel):
         num_path_decode_fc_layers  = cfg["model_params"]["num_path_decode_fc_layers"]
         path_decode_fc_units       = cfg["model_params"]["path_decode_fc_units"]
         path_decode_fc_activation  = cfg["model_params"]["path_decode_fc_activation"]
-        increment_net              = cfg["model_params"]["increment_net"]
         path_noise_level           = cfg["model_params"]["path_noise_level"]
 
         pathDec_use_attention_hist = cfg["model_params"]["pathDec_use_attention_hist"]
         pathDec_use_attention_img  = cfg["model_params"]["pathDec_use_attention_img"]
+
+        use_angle                  = cfg["model_params"]["use_angle"]
+
+        mruv_guiding               = cfg["model_params"]["mruv_guiding"]
+
+        if use_angle:
+            num_outs = 3
+        else:
+            num_outs = 2
 
         imageProcPixelNum          = ImageEncModel.output_shape[1]
         imageProcFeatNum           = ImageEncModel.output_shape[2]
@@ -379,7 +442,10 @@ def pathDecoderModel_V2(cfg, ImageEncModel, HistEncModel):
                                             name="Input_History_Out")
         Input_Last_Hidden_State = keras.Input(batch_shape=(gen_batch_size, pathDec_recurrent_unit_num), 
                                             name="Input_Last_Hidden_State")
-        Input_position = keras.Input(batch_shape=(gen_batch_size, 3), name="Input_position")
+        Input_position = keras.Input(batch_shape=(gen_batch_size, num_outs), name="Input_position")
+        if mruv_guiding:
+            Input_mruv = keras.Input(batch_shape=(gen_batch_size, num_outs), name="Input_mruv")
+            Input_mruv_conf = keras.Input(batch_shape=(gen_batch_size, num_outs), name="Input_mruv_conf")
 
         # Add noise
         in_position = tf.keras.layers.GaussianNoise(path_noise_level)(Input_position)
@@ -417,7 +483,13 @@ def pathDecoderModel_V2(cfg, ImageEncModel, HistEncModel):
 
         with tf.name_scope("PathGeneration"):            
             # Concatenate feature tensors with current position
-            featT = keras.layers.Concatenate(axis=-1, name='pathFeatConcat')([imageAttnFeatT, histAttnFeatT, in_position])
+            feature_list = [imageAttnFeatT, histAttnFeatT, in_position]
+            if mruv_guiding:
+                feature_list.append(Input_mruv)
+                feature_list.append(Input_mruv_conf)
+                
+
+            featT = keras.layers.Concatenate(axis=-1, name='pathFeatConcat')(feature_list)
 
 
             # Get recurrent unit to use
@@ -446,22 +518,25 @@ def pathDecoderModel_V2(cfg, ImageEncModel, HistEncModel):
                                             activation = path_decode_fc_activation,
                                             name='pathOutHid_%d'%idx_decode_layer)(featOutT)
             # Last output
-            pathOut = keras.layers.Dense(3,
+            pathOut = keras.layers.Dense(num_outs,
                                         # kernel_regularizer=keras.regularizers.l1_l2(0.01,0.01),
                                         activation = None,
                                         name='pathOutLinear')(featOutT)
 
-            if increment_net:
-                pathOut += Input_position
+
+        input_list = [Input_position, 
+                      Input_Image_Features,
+                      Input_History_Out, 
+                      Input_History_Hidden, 
+                      Input_Last_Hidden_State]
+        if mruv_guiding:
+            input_list.append(Input_mruv)
+            input_list.append(Input_mruv_conf)
 
         # Create model
-        return keras.Model([Input_position,
-                            Input_Image_Features,
-                            Input_History_Out, 
-                            Input_History_Hidden, 
-                            Input_Last_Hidden_State],
-                        [pathOut, featHidT, attenScores_image, attenScores_history],
-                        name='Path_Decoder_Model')
+        return keras.Model(input_list,
+                           [pathOut, featHidT, attenScores_image, attenScores_history],
+                           name='Path_Decoder_Model')
 
 
 def pathDecoderModel_V1(cfg, ImageEncModel, HistEncModel):
@@ -490,6 +565,13 @@ def pathDecoderModel_V1(cfg, ImageEncModel, HistEncModel):
     num_path_decode_fc_layers  = cfg["model_params"]["num_path_decode_fc_layers"]
     path_decode_fc_units       = cfg["model_params"]["path_decode_fc_units"]
     path_decode_fc_activation  = cfg["model_params"]["path_decode_fc_activation"]
+
+    use_angle                  = cfg["model_params"]["use_angle"]
+
+    if use_angle:
+        num_outs = 3
+    else:
+        num_outs = 2
 
     imageProcPixelNum          = ImageEncModel.output_shape[1]
     imageProcFeatNum           = ImageEncModel.output_shape[2]
@@ -543,7 +625,7 @@ def pathDecoderModel_V1(cfg, ImageEncModel, HistEncModel):
                                           activation = path_decode_fc_activation,
                                           name='pathOutHid_%d'%idx_decode_layer)(featOutT)
         # Last output
-        pathOut = keras.layers.Dense(3,
+        pathOut = keras.layers.Dense(num_outs,
                                     activation = None,
                                     name='pathOutLinear')(featOutT)
 
@@ -563,6 +645,44 @@ def pathDecoderModel_V1(cfg, ImageEncModel, HistEncModel):
 ###############################################################################
 # ------------------------ PATH HISTORY ENCODING NET ------------------------ #
 ###############################################################################
+
+def mruvModel(cfg):
+
+    histEnc_recurrent_unit_num = cfg["model_params"]["history_encoder_recurrent_units_number"]
+    num_mruv_layers     = cfg["model_params"]["num_mruv_layers"]
+    mruv_units          = cfg["model_params"]["mruv_units"]
+    mruv_activation     = keras.layers.LeakyReLU(alpha=0.1)
+
+    use_angle              = cfg["model_params"]["use_angle"]
+
+    if use_angle:
+        num_outs = 3
+    else:
+        num_outs = 2
+
+    with tf.name_scope("mruvModel"):
+        # Inputs
+        Input_mruv_feats = keras.Input(shape=(histEnc_recurrent_unit_num), 
+                                        name="Input_history_features")
+
+        mruv_feats = Input_mruv_feats
+
+        for idx_layer in range(num_mruv_layers):
+            mruv_feats = keras.layers.Dense(mruv_units[idx_layer],
+                                        name='mruvHid_%d'%idx_layer,
+                                        activation=mruv_activation)(mruv_feats)
+
+
+        # Last output
+        mruvOut = keras.layers.Dense(num_outs*3,
+                                    activation = None,
+                                    name='mruvOutLinear')(mruv_feats)
+
+        vOut, aOut, confidenceOut = tf.split(mruvOut, 3, -1)
+
+        # Create model
+        return keras.Model([Input_mruv_feats], [vOut, aOut, confidenceOut], name='mruv_Model')
+
 
 def pathEncodingModel(cfg, return_sequences=False):
     '''
@@ -589,8 +709,15 @@ def pathEncodingModel(cfg, return_sequences=False):
 
         CarNet                     = cfg["model_params"]["CarNet"]
 
+        use_angle              = cfg["model_params"]["use_angle"]
+
+        if use_angle:
+            num_ins = 3
+        else:
+            num_ins = 2
+
         # Inputs
-        Input_hist_frames = keras.Input(batch_shape=(gen_batch_size, 1, 3), 
+        Input_hist_frames = keras.Input(batch_shape=(gen_batch_size, 1, num_ins), 
                                         name="Input_history_frames")
 
         # Add noise

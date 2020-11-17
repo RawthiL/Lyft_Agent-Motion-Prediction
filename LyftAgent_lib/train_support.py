@@ -63,9 +63,9 @@ def L_loss_single2mult(objPath, predPAth, availPoints):
 
     out_L = list()
     for idx_batch in range(objPath.shape[0]):
-        valLikelihood = tf_neg_multi_log_likelihood(objPath[idx_batch,:,:2], 
-                                                                    tf.expand_dims(predPAth[idx_batch,:,:2], axis=0), 
-                                                                    1.0, 
+        valLikelihood = tf_neg_multi_log_likelihood(objPath[idx_batch,:,:2],
+                                                                    tf.expand_dims(predPAth[idx_batch,:,:2], axis=0),
+                                                                    1.0,
                                                                     availPoints[idx_batch,:])
 
         out_L.append(valLikelihood)
@@ -81,30 +81,53 @@ def L_loss_single2mult(objPath, predPAth, availPoints):
 def L2_loss(objPath, predPAth, availPoints):
     '''
     Calculate the mean L2 loss of the prediction.
-    
+
     Arguments:
     objPath --- Real path.
     predPAth --- Predicted path.
-    availPoints --- Number valid real points.   
-        
+    availPoints --- Number valid real points.
+
     Outputs:
     out_loss --- Mean L2 loss.
     '''
-    
+
     # Mask with availability
-    predPAth = tf.multiply(predPAth, tf.tile(tf.expand_dims(availPoints,axis=-1), [1,1,3]))
-    objPath = tf.multiply(objPath, tf.tile(tf.expand_dims(availPoints,axis=-1), [1,1,3]))
+    predPAth = tf.multiply(predPAth, tf.tile(tf.expand_dims(availPoints,axis=-1), [1,1,predPAth.shape[-1]]))
+    objPath = tf.multiply(objPath, tf.tile(tf.expand_dims(availPoints,axis=-1), [1,1,predPAth.shape[-1]]))
     # L2
     out_loss = tf.reduce_sum((predPAth - objPath)**2, axis = -1)
     out_loss = tf.reduce_sum(out_loss, axis = -1)
-    
+
     # Get mean error for each sample in batch
     stepsInfer_byBatch = tf.reduce_sum(availPoints, axis = -1)
-    
+
     return tf.divide(out_loss, stepsInfer_byBatch)
-    
 
 
+def tf_diff_along_step(a):
+
+    diff = (tf.roll(a, shift=1, axis=1) - a)
+
+    return diff[:,1:,:]
+
+def get_velocity_and_acceleration(batch_hist_pos):
+
+
+    v_inst = tf_diff_along_step(batch_hist_pos)
+    v = tf.reduce_mean(v_inst, axis = 1)
+    std_v = tf.math.reduce_std(v_inst, axis = 1)
+    v_mean_norm_conf = tf.divide((std_v/tf.sqrt(tf.cast(batch_hist_pos.shape[1], dtype=tf.float32))),v)
+    v_mean_norm_conf = tf.abs(v_mean_norm_conf)
+
+    a_inst = tf_diff_along_step(tf_diff_along_step(batch_hist_pos))
+    a = tf.reduce_mean(a_inst, axis = 1)
+    std_a = tf.math.reduce_std(a_inst, axis = 1)
+    a_mean_norm_conf = tf.divide((std_a/tf.sqrt(tf.cast(batch_hist_pos.shape[1], dtype=tf.float32))),a)
+    a_mean_norm_conf = tf.abs(a_mean_norm_conf)
+
+    confidence = 1.0-tf.clip_by_value(v_mean_norm_conf*a_mean_norm_conf, 0.0, 1.0)#tf.multiply(v_mean_norm_conf,a_mean_norm_conf)
+
+    return v, a, confidence
 
 ###############################################################################
 # ------------------------ CUSTOM TRAIN FUNCTIONS --------------------------- #
@@ -119,8 +142,8 @@ def get_mean_and_std_norm(tensor_list):
 
 
 @tf.function
-def generator_train_step_Base(img_t, target_path, TargetAvail, ImageEncModel, PathDecModel, 
-                             optimizer_gen, 
+def generator_train_step_Base(img_t, target_path, TargetAvail, ImageEncModel, PathDecModel,
+                             optimizer_gen,
                              gen_loss,
                              forwardpass_use,
                              loss_use = [L2_loss],
@@ -131,10 +154,10 @@ def generator_train_step_Base(img_t, target_path, TargetAvail, ImageEncModel, Pa
 
     # Start gradient tape
     with tf.GradientTape(persistent=True) as gen_tape:
-              
+
         # Get predicted paths
         with tf.name_scope("Forward_pass"):
-            thisPath = forwardpass_use(img_t, ImageEncModel, PathDecModel, training_state = True)      
+            thisPath = forwardpass_use(img_t, ImageEncModel, PathDecModel, training_state = True)
 
         with tf.name_scope("Loss"):
             # Compute predicted path loss
@@ -148,21 +171,21 @@ def generator_train_step_Base(img_t, target_path, TargetAvail, ImageEncModel, Pa
         # Gradient wrt ImageEncModel
         image_model_trainable =  len(ImageEncModel.trainable_variables)>0
         if image_model_trainable:
-            grad_gen_img = gen_tape.gradient(target  = gen_step_loss,  
+            grad_gen_img = gen_tape.gradient(target  = gen_step_loss,
                                             sources = ImageEncModel.trainable_variables)
         # Gradient wrt PathDecModel
-        grad_gen_dec  = gen_tape.gradient(target  = gen_step_loss,  
+        grad_gen_dec  = gen_tape.gradient(target  = gen_step_loss,
                                         sources = PathDecModel.trainable_variables)
-        # Delete persistent gradient 
+        # Delete persistent gradient
         del gen_tape
 
         # We now clip the recursive models
         if image_model_trainable:
-        #     grad_gen_img = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_img]      
-            grad_gen_img, _ = tf.clip_by_global_norm(grad_gen_img, gradient_clip_value)      
-        
+        #     grad_gen_img = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_img]
+            grad_gen_img, _ = tf.clip_by_global_norm(grad_gen_img, gradient_clip_value)
+
         grad_gen_dec, _ = tf.clip_by_global_norm(grad_gen_dec, gradient_clip_value)
-        
+
         train_vars = list()
         if image_model_trainable:
             train_vars += ImageEncModel.trainable_variables
@@ -174,49 +197,54 @@ def generator_train_step_Base(img_t, target_path, TargetAvail, ImageEncModel, Pa
 
         # Apply update
         optimizer_gen.apply_gradients(zip(grad_gen_clip, train_vars))
-   
+
     # Log gradient norms for each model
     out_grad = list()
     if image_model_trainable:
-        out_grad.append(grad_gen_img)        
+        out_grad.append(grad_gen_img)
     out_grad.append(grad_gen_dec)
-      
 
-    
 
-    
-    
+
+
+
+
     # Save loss
     gen_loss(tf.reduce_mean(gen_step_loss))
-        
+
     return gen_step_loss_list, out_grad
 
 
 @tf.function
 def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
-                         ImageEncModel, HistEncModel, PathDecModel, 
-                         optimizer_gen, 
+                         ImageEncModel, HistEncModel, PathDecModel,
+                         optimizer_gen,
                          gen_loss,
                          initial_hidden_state,
                          forwardpass_use,
                          loss_use = [L2_loss],
                          loss_couplings = [1],
                          stepsInfer = 50,
-                         use_teacher_force=True, 
+                         use_teacher_force=True,
                          teacher_force_weight = tf.constant(1.0, dtype=tf.float32),
                          gradient_clip_value = 10.0,
                          gradient_clip_thorugh_time_value = 1.0,
-                         stop_gradient_on_prediction = False):
-    
+                         stop_gradient_on_prediction = False,
+                         increment_net = False,
+                         mruv_guiding = False,
+                         mruv_weight = 0.1,
+                         mruv_model = None,
+                         mruv_model_trainable = False):
+
     '''
     Calculate the mean L2 loss of the prediction.
-    
+
     Arguments:
     img_t --- Multi-channel map input tensor.
     hist_t --- Path history tensor.
     target_path --- Target/Real path.
-    HistAvail --- Number valid history points. 
-    TargetAvail --- Number valid target/real points. 
+    HistAvail --- Number valid history points.
+    TargetAvail --- Number valid target/real points.
     ImageEncModel --- Model used to encode the input image (img_t)
     HistEncModel --- Model used to encode the input history (hist_t)
     PathDecModel --- Model used to produce the requested predictions.
@@ -229,28 +257,43 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
     use_teacher_force --- Use a linear interpolation of the target path and the last predicted path.
     teacher_force_weight --- Fraction of the target path used in the linear interpolation between target and predicted.
     '''
-    
+
     # Get number of steps to generate
     # if not tf.is_tensor(stepsInfer):
     #     stepsInfer = target_path.shape[1]
-    
+
 
     # Start gradient tape
     with tf.GradientTape(persistent=True) as gen_tape:
-              
+
         # Get predicted paths
         with tf.name_scope("Forward_pass"):
-            thisPath = forwardpass_use(img_t, hist_t, HistAvail, stepsInfer, 
+            outputs_fpass = forwardpass_use(img_t, hist_t, HistAvail, stepsInfer,
                                         ImageEncModel, HistEncModel, PathDecModel,
-                                        thisHiddenState = initial_hidden_state, 
-                                        use_teacher_force = use_teacher_force, 
+                                        thisHiddenState = initial_hidden_state,
+                                        use_teacher_force = use_teacher_force,
                                         teacher_force_weight = teacher_force_weight,
                                         target_path = target_path,
                                         stop_gradient_on_prediction = stop_gradient_on_prediction,
                                         gradient_clip_thorugh_time_value= gradient_clip_thorugh_time_value,
-                                        training_state = True)      
+                                        training_state = True,
+                                        increment_net = increment_net,
+                                        mruv_guiding = mruv_guiding,
+                                        mruv_weight = mruv_weight,
+                                        mruv_model = mruv_model,
+                                        mruv_model_trainable = mruv_model_trainable)
+
+
+            if mruv_guiding:
+                thisPath = outputs_fpass[0]
+                thisV = outputs_fpass[1]
+                thisA = outputs_fpass[2]
+                thisConf = outputs_fpass[3]
+            else:
+                thisPath = outputs_fpass
 
         with tf.name_scope("Loss"):
+
             # Compute predicted path loss
             gen_step_loss_list = list()
             gen_step_loss = 0
@@ -259,145 +302,182 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
                 gen_step_loss_list.append(loss_act)
                 gen_step_loss += k_coup*loss_act
 
+            if mruv_guiding and mruv_model_trainable:
+                targetV, targetA, _ = get_velocity_and_acceleration(hist_t)
+                lossV = tf.reduce_mean((thisV - targetV)**2, axis = -1)
+                gen_step_loss_list.append(lossV)
+                lossA = tf.reduce_mean((thisA - targetA)**2, axis = -1)
+                gen_step_loss_list.append(lossA)
+
+                # Get expected mruv path
+                mruv_path = lyl_nn.compute_mruv_path(targetV, targetA, stepsInfer)
+                # Compute MSE between mruv and target
+                mruv_L2 = tf.reduce_mean((mruv_path[:,1:stepsInfer+1,:] - target_path[:,:stepsInfer,:])**2, axis = 1)
+                # mruv_confidence = tf.exp(mruv_L2)
+                mruv_confidence = mruv_L2/tf.norm(target_path[:,:stepsInfer,:], axis = 1)
+                # Get confidence Loss
+                lossConf = tf.reduce_sum((thisConf - mruv_confidence)**2, axis = -1)
+                gen_step_loss_list.append(lossConf)
+
+                # lossConf = 0.0
+
+                mruv_loss = lossV+lossA+(lossConf*0.00001)
+
+
+
+
     with tf.name_scope("Gradient_calc"):
         # Gradient wrt ImageEncModel
         image_model_trainable =  len(ImageEncModel.trainable_variables)>0
         if image_model_trainable:
-            grad_gen_img = gen_tape.gradient(target  = gen_step_loss,  
+            grad_gen_img = gen_tape.gradient(target  = gen_step_loss,
                                             sources = ImageEncModel.trainable_variables)
         # Gradient wrt HistEncModel
-        grad_gen_hist = gen_tape.gradient(target  = gen_step_loss,  
+        grad_gen_hist = gen_tape.gradient(target  = gen_step_loss,
                                         sources = HistEncModel.trainable_variables)
         # Gradient wrt PathDecModel
-        grad_gen_dec  = gen_tape.gradient(target  = gen_step_loss,  
+        grad_gen_dec  = gen_tape.gradient(target  = gen_step_loss,
                                         sources = PathDecModel.trainable_variables)
-        # Delete persistent gradient 
+
+        if mruv_guiding and mruv_model_trainable:
+            grad_mruv  = gen_tape.gradient(target  = mruv_loss,
+                                           sources = mruv_model.trainable_variables)
+
+        # Delete persistent gradient
         del gen_tape
 
         # We now clip the recursive models
         if image_model_trainable:
-        #     grad_gen_img = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_img]      
-            grad_gen_img, _ = tf.clip_by_global_norm(grad_gen_img, gradient_clip_value)      
-        # grad_gen_hist = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_hist]      
-        # grad_gen_dec = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_dec]     
+        #     grad_gen_img = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_img]
+            grad_gen_img, _ = tf.clip_by_global_norm(grad_gen_img, gradient_clip_value)
+        # grad_gen_hist = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_hist]
+        # grad_gen_dec = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_dec]
         grad_gen_hist, _ = tf.clip_by_global_norm(grad_gen_hist, gradient_clip_value)
         grad_gen_dec, _ = tf.clip_by_global_norm(grad_gen_dec, gradient_clip_value)
-        # grad_gen_hist = [tf.clip_by_value(grad, 
-        #                                    clip_value_min=-gradient_clip_value, 
-        #                                    clip_value_max=gradient_clip_value) 
+        # grad_gen_hist = [tf.clip_by_value(grad,
+        #                                    clip_value_min=-gradient_clip_value,
+        #                                    clip_value_max=gradient_clip_value)
         #                   for grad in grad_gen_hist]
-        # grad_gen_dec = [tf.clip_by_value(grad, 
-        #                                    clip_value_min=-gradient_clip_value, 
-        #                                    clip_value_max=gradient_clip_value) 
+        # grad_gen_dec = [tf.clip_by_value(grad,
+        #                                    clip_value_min=-gradient_clip_value,
+        #                                    clip_value_max=gradient_clip_value)
         #                   for grad in grad_gen_dec]
-        # 
+        #
         # Get full list of trainable variables and gradients
         train_vars = list()
         if image_model_trainable:
             train_vars += ImageEncModel.trainable_variables
         train_vars += HistEncModel.trainable_variables
         train_vars += PathDecModel.trainable_variables
+        if mruv_guiding and mruv_model_trainable:
+            train_vars += mruv_model.trainable_variables
         grad_gen_clip = list()
         if image_model_trainable:
             grad_gen_clip += grad_gen_img
         grad_gen_clip += grad_gen_hist
         grad_gen_clip += grad_gen_dec
+        if mruv_guiding and mruv_model_trainable:
+            grad_gen_clip += grad_mruv
 
         # Apply update
         optimizer_gen.apply_gradients(zip(grad_gen_clip, train_vars))
-   
+
+
     # Log gradient norms for each model
     out_grad = list()
     if image_model_trainable:
-        out_grad.append(grad_gen_img)        
+        out_grad.append(grad_gen_img)
     out_grad.append(grad_gen_hist)
     out_grad.append(grad_gen_dec)
-      
 
-    
+    if mruv_guiding and mruv_model_trainable:
+        out_grad.append(grad_mruv)
 
-    
-    
+
+
+
+
+
     # Save loss
     gen_loss(tf.reduce_mean(gen_step_loss))
-        
+
     return gen_step_loss_list, out_grad
 
 
 def get_teacher_force_weight(tf_list, tf_lims, epoch, tf_weight_act, linearize=False):
     '''
     Get the teacher force weight given the epoch and the weight planning.
-    
+
     Arguments:
     tf_list --- List of teacher force weights.
     tf_lims --- List of teacher force limit epochs for each weight.
     epoch --- Current train epoch.
     tf_weight_act --- Current teacher force weight.
     linearize --- Linearize the teacher force weight between the given points.
-        
+
     Outputs:
     tf_weight_new --- New teacher force weight.
     '''
-    
+
     # Get current weight
     tf_lims = np.array(tf_lims)
-    
+
     if linearize:
         tf_weight_new = np.interp(epoch, tf_lims, tf_list)
     else:
         tf_weight_new = tf_list[np.squeeze(np.argwhere(tf_lims>=epoch)[0])]
-            
+
     # If the value is new, inform
     if tf_weight_act != tf_weight_new:
         print('Teacher force weight set to: %g'%tf_weight_new)
-    
+
     return tf_weight_new
-   
-    
+
+
 def update_lr(lr_list, lr_lims, epoch, optimizer):
     '''
     Set the learning rate given the epoch and the learning rate planning.
-       
+
     Arguments:
     lr_list --- List of learning rates.
     lr_lims --- List of learning rate limit epochs.
     epoch --- Current train epoch.
     optimizer --- Keras optimizer.
     '''
-    
+
     # Get new learning rate
     lr_new = lr_list[np.squeeze(np.argwhere(np.array(lr_lims) >= epoch)[0])]
     # Update and inform if needed
     if not np.isclose(lr_new, optimizer.learning_rate.numpy(), rtol = 1e-10):
         K.set_value(optimizer.learning_rate, lr_new)
         print('Learning rate set to: %g'%optimizer.learning_rate.numpy())
-        
+
     return lr_new
 
 
 def get_future_steps_train(fs_list, fs_lims, epoch, fs_act):
     '''
     Get the number of future steps to train on given the epoch and the planning.
-    
+
     Arguments:
     fs_list --- List of future steps.
     fs_lims --- List of limit epochs.
     epoch --- Current train epoch.
     fs_act --- Current future steps weight.
-        
+
     Outputs:
     fs_new --- New future steps to train on.
     '''
-    
+
     # Get current weight
     fs_lims = np.array(fs_lims)
-    
+
     fs_new = fs_list[np.squeeze(np.argwhere(fs_lims>=epoch)[0])]
-            
+
     # If the value is new, inform
     if fs_act != fs_new:
         print('Training on %d future steps.'%fs_new)
-    
+
     return fs_new
 
 
@@ -406,34 +486,35 @@ def get_future_steps_train(fs_list, fs_lims, epoch, fs_act):
 ###############################################################################
 
 def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecModel, forwardpass_use,
-                   steps_validate = None, all_metrics = False, stepsInfer = -1, base_model = False):
+                   steps_validate = None, all_metrics = False, stepsInfer = -1, base_model = False,
+                   mruv_guiding = False, mruv_weight = 0.1, mruv_model = None, mruv_model_trainable = False, increment_net = False):
     '''
     Validate the generator model using the validation dataset.
-    
+
     Arguments:
     tf_validation_dataset --- TensorFlow Dataset object of the validation dataset.
     ImageEncModel --- Model used to encode the input image.
     HistEncModel --- Model used to encode the input history.
     PathDecModel --- Model used to produce the requested predictions.
     steps_validate --- Number of steps to perform validation on (None means all).
-        
+
     Outputs:
     out_loss --- Mean L2 validation loss.
     '''
-    
+
     idx_val = 0
-    valLoss_acum = 0 
+    valLoss_acum = 0
 
     valLikelihood_acum = 0
     valTime_displace_acum = 0
 
     gen_batch_size = PathDecModel.inputs[0].shape[0]
 
-    
+
     custom_steps = True
     val_dataset_prog_bar = tqdm(tf_validation_dataset, total=steps_validate)
-    for (valSampleMapComp, valSampeHistPath, valSampeTargetPath, 
-             valHistAvail, valTargetAvail, 
+    for (valSampleMapComp, valSampeHistPath, valSampeTargetPath,
+             valHistAvail, valTargetAvail,
              valTimeStamp, valTrackID, valRasterFromAgent, valWorldFromAgent, valCentroid, valIDX) in val_dataset_prog_bar:
 
         if gen_batch_size != None:
@@ -446,22 +527,27 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
 
         # Predict
         if base_model:
-            valPredPath = forwardpass_use(valSampleMapComp,  
+            valPredPath = forwardpass_use(valSampleMapComp,
                                                     ImageEncModel,  PathDecModel,
                                                     use_teacher_force=False)
         else:
             PathDecModel.reset_states()
             HistEncModel.reset_states()
-            valPredPath = forwardpass_use(valSampleMapComp, valSampeHistPath, valHistAvail, stepsInfer, 
+            valPredPath = forwardpass_use(valSampleMapComp, valSampeHistPath, valHistAvail, stepsInfer,
                                                     ImageEncModel, HistEncModel, PathDecModel,
-                                                    use_teacher_force=False)
+                                                    use_teacher_force=False,
+                                                    increment_net = increment_net,
+                                                    mruv_guiding = mruv_guiding,
+                                                    mruv_weight = mruv_weight,
+                                                    mruv_model = mruv_model,
+                                                    mruv_model_trainable = mruv_model_trainable)
 
         valPredPath = valPredPath.numpy()
         # Calculate loss
         valLoss = L2_loss(valSampeTargetPath[:,:stepsInfer,:], valPredPath, valTargetAvail[:,:stepsInfer])
         valLoss = np.mean(valLoss.numpy())
 
-        # Update 
+        # Update
         valLoss_acum += valLoss
 
 
@@ -470,15 +556,15 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
             Time_displace_batch = 0
             for idx_batch in range(valPredPath.shape[0]):
 
-                Time_displace_batch += metrics.time_displace(valSampeTargetPath[idx_batch,:stepsInfer,:2], 
-                                                                        np.expand_dims(valPredPath[idx_batch,:stepsInfer,:2], axis=0), 
-                                                                        np.ones((1)), 
-                                                                        valTargetAvail[idx_batch,:stepsInfer]) 
+                Time_displace_batch += metrics.time_displace(valSampeTargetPath[idx_batch,:stepsInfer,:2],
+                                                                        np.expand_dims(valPredPath[idx_batch,:stepsInfer,:2], axis=0),
+                                                                        np.ones((1)),
+                                                                        valTargetAvail[idx_batch,:stepsInfer])
 
             valTime_displace_acum += Time_displace_batch/valPredPath.shape[0]
 
         valLikelihood_acum += np.mean(L_loss_single2mult(valSampeTargetPath[:,:stepsInfer,:], valPredPath, valTargetAvail[:,:stepsInfer]))
-                                                                             
+
 
 
         # Update progress bar
@@ -504,25 +590,25 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
         if idx_val < steps_validate:
             print('The dataset finished before the requested number of steps was reached.')
 
-    if all_metrics:            
+    if all_metrics:
         return valLoss_acum/idx_val, valLikelihood_acum/idx_val, valTime_displace_acum/idx_val
     else:
         return valLoss_acum/idx_val
 
 
 
-    
+
 
 ###############################################################################
 # ------------------------ TF DATASET READER -------------------------------- #
 ###############################################################################
 
 def meta_dict_pass(dataset, **kwargs):
-    ''' 
-    Dataset wrapper for TensorFlow Data compatibility 
-    
+    '''
+    Dataset wrapper for TensorFlow Data compatibility
+
     Yields the dataset without any order
-        
+
     Arguments:
     dataset --- Agent dataset from Lyft library
     '''
@@ -531,18 +617,18 @@ def meta_dict_pass(dataset, **kwargs):
         frame['sample_idx'] = sample_index
         yield frame
 
-def meta_dict_gen(dataset, 
-                  randomize_frame=False, 
-                  randomize_scene=False, 
-                  num_scenes=16000, 
+def meta_dict_gen(dataset,
+                  randomize_frame=False,
+                  randomize_scene=False,
+                  num_scenes=16000,
                   frames_per_scene = 1,
                   yield_only_large_distances = False,
                   min_max_dist = 25.0):
-    ''' 
-    Dataset generator wrapper for TensorFlow Data compatibility 
-    
+    '''
+    Dataset generator wrapper for TensorFlow Data compatibility
+
     Yields a fixed number of scenes and frames
-        
+
     Arguments:
     dataset --- Agent dataset from Lyft library
     randomize_frame --- Frames are yield in random order
@@ -570,7 +656,7 @@ def meta_dict_gen(dataset,
         # Shuffle frame order if requested
         if randomize_frame:
             np.random.shuffle(this_scene_idxs)
-        
+
         # Get the number of frames to yield from this scene
         if requested_frames_per_scene > this_scene_idxs.shape[0]:
             frames_per_scene = this_scene_idxs.shape[0]
@@ -582,7 +668,7 @@ def meta_dict_gen(dataset,
         for frame_idx in range(frames_per_scene):
             sample_index = this_scene_idxs[frame_idx]
             sample_out = dataset[sample_index]
-            
+
             # Filter samples with low maximum displacement if requested
             if yield_only_large_distances:
                 dist_max = np.sqrt(sample_out['target_positions'][np.sum(sample_out['target_availabilities']),0]**2\
@@ -594,19 +680,19 @@ def meta_dict_gen(dataset,
             sample_out['sample_idx'] = sample_index
             yield sample_out
     return
-                
-def get_tf_dataset(dataset, 
+
+def get_tf_dataset(dataset,
                    num_hist_frames,
                    map_input_shape,
                    num_future_frames,
                    randomize_frame=False,
-                   randomize_scene=False, 
-                   num_scenes=-1, 
+                   randomize_scene=False,
+                   num_scenes=-1,
                    frames_per_scene = -1,
                    meta_dict_use = meta_dict_gen):
     '''
     Creates a TensorFlow dict dataset from a Lyft dataset generator.
-    
+
     Arguments:
     dataset --- Agent dataset from Lyft library
     num_hist_frames --- Number of history points in a frame
@@ -616,7 +702,7 @@ def get_tf_dataset(dataset,
     randomize_scene --- Scenes are yield in random order
     num_scenes --- Total number of scenes to be yield in one epoch
     frames_per_scene --- Number of frames to yield per scene (-1 means all)
-    
+
     Outputs:
     tf_dataset --- TensorFlow Dataset object.
     '''
@@ -635,7 +721,7 @@ def get_tf_dataset(dataset,
                                                                 randomize_scene=randomize_scene,
                                                                 num_scenes=num_scenes,
                                                                 frames_per_scene=frames_per_scene),
-                                          output_types={'image': tf.float32, 
+                                          output_types={'image': tf.float32,
                                                         'target_positions': tf.float32,
                                                         'target_yaws': tf.float32,
                                                         'target_availabilities': tf.float32,
@@ -653,9 +739,9 @@ def get_tf_dataset(dataset,
                                                         'yaw': tf.float32,
                                                         'extent': tf.float32,
                                                         'sample_idx': tf.int32},
-                                          output_shapes={'image': (3+num_hist_frames*2+2, 
-                                                                   map_input_shape[0], 
-                                                                   map_input_shape[1]), 
+                                          output_shapes={'image': (3+num_hist_frames*2+2,
+                                                                   map_input_shape[0],
+                                                                   map_input_shape[1]),
                                                          'target_positions': (num_future_frames, 2),
                                                          'target_yaws': (num_future_frames,1),
                                                          'target_availabilities': (num_future_frames,),
@@ -678,12 +764,12 @@ def get_tf_dataset(dataset,
 def create_fade_image(input_multiCh_image, fade_factor = 0.75, update_threshold = 0.1):
     '''
     Create an image with previous history layers faded in.
-    
+
     Arguments:
     input_multiCh_image --- Ego or Agent map with channel size equal to number of history frames
     fade_factor --- Intensity fade of the history frames.
     update_threshold --- Minimum image activity to be kept.
-        
+
     Outputs:
     imgFade --- Ego or Agent map with faded history frames.
     '''
@@ -700,22 +786,22 @@ def create_fade_image(input_multiCh_image, fade_factor = 0.75, update_threshold 
         imgFade += auxFadeIn
         # Update mask
         sample_mask = 1.0-tf.cast((imgFade>update_threshold),tf.float32)
-        
+
     return imgFade
 
-   
+
 
 # Sample conformation functions (tf and numpy)
-def tf_get_input_sample(datasetSample, image_preprocess_fcn = lambda x: x, use_fading = True):
+def tf_get_input_sample(datasetSample, image_preprocess_fcn = lambda x: x, use_fading = True, use_angle = True):
     '''
     Tensorflow sample mapping function.
-    
-    Takes a frame and pre-process its information, resulting in selected data to 
+
+    Takes a frame and pre-process its information, resulting in selected data to
     be used in the model.
-    
+
     Arguments:
     datasetSample --- Sample tensor (dict).
-        
+
     Outputs:
     sampleMapComp --- Multi-channel image with the RGB map and the faded Ego and Agents
     sampleHistPath --- Tensor of history [num_hist_frames x coordinates]
@@ -726,17 +812,17 @@ def tf_get_input_sample(datasetSample, image_preprocess_fcn = lambda x: x, use_f
     trackID --- Track ID of the agent
     thisRasterFromAgent --- Raster from Agent conversion matrix.
     '''
-    
+
     # Get number of history frames
     num_hist_frames = datasetSample['history_positions'].shape[0]
 
     image_splits = tf.split(datasetSample['image'], num_or_size_splits=[num_hist_frames, num_hist_frames, 3], axis=0)
-    
+
     # Map to RGB
     sampleMap = tf.transpose(image_splits[2], perm=[1, 2, 0])
     sampleMap *= 255
     sampleMap = image_preprocess_fcn(sampleMap)
-    
+
     if use_fading:
         # Ego to fade
         sampleEgoFade = create_fade_image(image_splits[1])
@@ -748,7 +834,7 @@ def tf_get_input_sample(datasetSample, image_preprocess_fcn = lambda x: x, use_f
         sampleEgoList = list()
         for i in range(num_hist_frames):
             sampleEgoList.append(image_preprocess_fcn(image_splits[1][i,:,:]))
-    
+
     if use_fading:
         # Agents to fade
         sampleAgentsFade = create_fade_image(image_splits[0])
@@ -760,7 +846,7 @@ def tf_get_input_sample(datasetSample, image_preprocess_fcn = lambda x: x, use_f
         sampleAgentsList = list()
         for i in range(num_hist_frames):
             sampleAgentsList.append(image_preprocess_fcn(image_splits[0][i,:,:]))
-    
+
     # Concatenate image inputs
     if use_fading:
         sampleMapComp = tf.concat([sampleMap, sampleEgoFade, sampleAgentsFade], axis = -1)
@@ -770,25 +856,31 @@ def tf_get_input_sample(datasetSample, image_preprocess_fcn = lambda x: x, use_f
         sampleAgentsList = tf.convert_to_tensor(sampleAgentsList)
         sampleAgentsList = tf.reshape(sampleAgentsList, shape=(image_splits[0].shape[1], image_splits[0].shape[2], -1))
         sampleMapComp = tf.concat([sampleMap, sampleEgoList, sampleAgentsList], axis = -1)
-        
-    
+
+
     # History path
     x = datasetSample['history_positions'][:,0]#/100.0
     x = tf.expand_dims(x, axis=-1)
     y = datasetSample['history_positions'][:,1]#/40.0
     y = tf.expand_dims(y, axis=-1)
-    a = datasetSample['history_yaws']#/np.pi
-    sampleHistPath = tf.concat([x, y, a], axis = -1)   
-    
-    
+    if use_angle:
+        a = datasetSample['history_yaws']#/np.pi
+        sampleHistPath = tf.concat([x, y, a], axis = -1)
+    else:
+        sampleHistPath = tf.concat([x, y], axis = -1)
+
     # Targets
     x = datasetSample['target_positions'][:,0]#/100.0
     x = tf.expand_dims(x, axis=-1)
     y = datasetSample['target_positions'][:,1]#/40.0
     y = tf.expand_dims(y, axis=-1)
-    a = datasetSample['target_yaws']#/np.pi
-    sampleTargetPath = tf.concat([x, y, a], axis = -1)  
-    
+    if use_angle:
+        a = datasetSample['target_yaws']#/np.pi
+        sampleTargetPath = tf.concat([x, y, a], axis = -1)
+    else:
+        sampleTargetPath = tf.concat([x, y], axis = -1)
+
+
     # Availability
     histAvail = datasetSample['history_availabilities']
     targetAvail = datasetSample['target_availabilities']
@@ -808,9 +900,9 @@ def tf_get_input_sample(datasetSample, image_preprocess_fcn = lambda x: x, use_f
 
     return sampleMapComp, sampleHistPath, sampleTargetPath, histAvail, targetAvail, timeStamp, trackID, thisRasterFromAgent, thisWorldFromAgent, thisCentroid, thisSampleIdx
 
-    
-    
-    
+
+
+
 ###############################################################################
 # ------------------------ TF MODEL LOAD/SAVE ------------------------------- #
 ###############################################################################
@@ -819,7 +911,7 @@ def tf_get_input_sample(datasetSample, image_preprocess_fcn = lambda x: x, use_f
 def save_model(model_save, save_path, save_name, use_keras=True):
     """
     Save model using Keras API (single .h5 file) OR a HDF5 for weights and JSON for model.
-    
+
     Arguments:
     model_save --- Keras model to save
     save_path --- Output folder
@@ -838,19 +930,19 @@ def save_model(model_save, save_path, save_name, use_keras=True):
             json_file.write(model_json)
         # serialize weights to HDF5
         model_save.save_weights(os.path.join(save_path,save_name+".h5"))
-    
+
     return
 
 def load_model(load_path, load_name, use_keras=True, custom_obj_dict=[]):
     """
-    Load model using Keras API (single .h5 file) OR from a HDF5 file for weights and a JSON file for model  
-    
+    Load model using Keras API (single .h5 file) OR from a HDF5 file for weights and a JSON file for model
+
     Arguments:
     load_path --- Model save folder
     load_name --- Name of the h5 file to be read
     use_keras --- Use keras API to save, else use JSON + HDF5
     custom_obj_dict --- Dictionary of custom objects for keras API (i.e. custom layers)
-    
+
     Outputs:
     model --- TensorFlow Keras model.
     """
@@ -869,14 +961,14 @@ def load_model(load_path, load_name, use_keras=True, custom_obj_dict=[]):
         loaded_model = keras.models.model_from_json(loaded_model_json)
         # load weights into new model
         loaded_model.load_weights(os.path.join(load_path,load_name))
-    
+
     return loaded_model
 
 
 def save_optimizer_state(optimizer, save_path, save_name):
     '''
     Save keras.optimizers object state.
-    
+
     Arguments:
     optimizer --- Optimizer object.
     save_path --- Path to save location.
@@ -887,7 +979,7 @@ def save_optimizer_state(optimizer, save_path, save_name):
     # Create folder if it does not exists
     if not os.path.exists(save_path):
         os.makedirs(save_path)
-    
+
     # save weights
     np.save(os.path.join(save_path, save_name), optimizer.get_weights())
 
@@ -896,7 +988,7 @@ def save_optimizer_state(optimizer, save_path, save_name):
 def load_optimizer_state(load_path, load_name, optimizer, model_train_vars):
     '''
     Loads keras.optimizers object state.
-    
+
     Arguments:
     load_path --- Path to save location.
     load_name --- Name of the .npy file to be read.
