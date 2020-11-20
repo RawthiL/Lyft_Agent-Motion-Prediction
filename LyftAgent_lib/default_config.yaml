@@ -1,0 +1,63 @@
+# Config format schema number
+format_version: 4
+
+###################
+## Model options
+model_params:
+
+  version: "Not defined in config"
+  CarNet: False
+  increment_net: False
+  use_angle: False
+  mruv_guiding: False
+  mruv_model_trainable: False
+  num_mruv_layers: 0
+  mruv_units:  []
+  pathDec_use_attention_hist: False
+  pathDec_use_attention_img: False
+  use_fading: False
+  base_image_model: "Not defined in config"
+  base_image_preprocess: "Not defined in config"
+  history_encoder_recurrent_unit: "Not defined in config"
+  history_encoder_recurrent_units_number: 0
+  num_hist_encode_layers: 0
+  hist_encode_units: []
+  hist_encode_activation: 'Not defined in config'
+  path_generation_decoder_recurrent_unit: "Not defined in config"
+  path_generation_decoder_recurrent_units_number: 0
+  pathDec_attention_pr_units: 0
+  num_path_decode_fc_layers: 0
+  path_decode_fc_units: []
+  path_decode_fc_activation: 'Not defined in config'
+  path_noise_level: 0.0
+
+
+  history_num_frames: 10
+  history_step_size: 0
+  history_delta_time: 0.1
+  future_num_frames: 50
+  future_step_size: 1
+  future_delta_time: 0.1
+
+###################
+## Training options
+training_params: 
+
+  gen_lr_list: [0.001, 0.001]
+  gen_lr_lims: [    0,  1000]
+  number_of_scenes: -1
+  randomize_scenes: False
+  frames_per_scene: -1
+  randomize_frames: False
+  epochs_train: 100
+  use_teacher_force: False
+  teacher_force_list: []
+  teacher_force_lims: []
+  init_decoder_on_history: False
+  future_steps_train_list: []
+  future_steps_train_lims: []
+  use_modulate_future_steps: False
+  retrain_inputs_image_model: False
+  retrain_all_image_model: False
+
+  

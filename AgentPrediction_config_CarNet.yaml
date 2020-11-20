@@ -5,71 +5,44 @@ format_version: 4
 ## Model options
 model_params:
 
-  version: "V2"
-  CarNet: False # Only V1
-
-
-  # The network is trained on calculating the increment from last step
-  increment_net: True 
+  version: "V1"
+  CarNet: True
 
   # Estimate yaw in addition to X and Y
   use_angle: False
 
-  # Whether or not use linear movement guiding in the network
-  mruv_guiding: True
-  # If true, the speed and acceleration is computed using a NN, if not the derivate is used
-  mruv_model_trainable: True
-  # Number of hidden layers of the mruv model (fully connected NN)
-  num_mruv_layers: 3
-  # Number of neurons per hidden layer
-  mruv_units:  [256, 32, 8]
-
-  # Whether or not use the attention mechanism on the image and history path feature tensors
-  pathDec_use_attention_hist: False
-  pathDec_use_attention_img: False
-
   # If true all history image channels are computed as a fadded image. 
   # The most recent frames have higher intensity an it decays into the past
-  use_fading: True
+  use_fading: False
 
   # Base model for image feature extraction 
   # Note: Each model has its own preprocessing function, please select the right one...
-  base_image_model: "MobileNetV2"
-  base_image_preprocess: "mobilenet_v2.preprocess_input"
-  # base_image_model: "InceptionV3"
-  # base_image_preprocess: "inception_v3.preprocess_input"
-  # base_image_model: "ResNet50"
-  # base_image_preprocess: "resnet.preprocess_input"
+  base_image_model: "ResNet50"
+  base_image_preprocess: "resnet.preprocess_input"
 
   
-  # Type of recurrent units used in the ego path encoding layer (GRU, LSTM, etc)
-  history_encoder_recurrent_unit: "GRU"
-  # Number of recurrent units used in the ego path encoding layer
-  history_encoder_recurrent_units_number: 256
   # Number of dense layers to process history coordinates
-  num_hist_encode_layers: 3
+  num_hist_encode_layers: 1
   # Units per dense layer to process history coordinates
-  hist_encode_units: [8, 32, 128]
+  hist_encode_units: [16]
   # Activation of dense layers to process history coordinates
   hist_encode_activation: 'relu'
-  # Type of recurrent units used in the ego path decoding layer (GRU, LSTM, etc)
-  path_generation_decoder_recurrent_unit: "GRU"
-  # Number of recurrent units used in the ego path decoding layer
-  path_generation_decoder_recurrent_units_number: 512
-
+  
 
   # Size of the intermediate space used in the attention mechanism
   pathDec_attention_pr_units: 64
   # Number of fully connected layers used to generate the output coordinates (not counting last)
-  num_path_decode_fc_layers: 3
-  # num_path_decode_fc_layers: 1
+  num_path_decode_fc_layers: 1
   # Number of units in the FC layers used to generate the output coordinates
-  path_decode_fc_units: [1024, 128, 8]
-  # path_decode_fc_units: [4096]
+  path_decode_fc_units: [16]
   # Activation of the FC layers used to generate the output coordinates
   path_decode_fc_activation: 'relu'
+  # Type of recurrent units used in the ego path decoding layer (GRU, LSTM, etc)
+  path_generation_decoder_recurrent_unit: "GRU"
+  # Number of recurrent units used in the ego path decoding layer
+  path_generation_decoder_recurrent_units_number: 32
   # Path corruption noise level
-  path_noise_level: 1.0
+  path_noise_level: 0.0
    
   # Number of history frames
   history_num_frames: 10
@@ -92,30 +65,20 @@ model_params:
 training_params: 
 
   # Learning rate list and epochs conforming a learning rate schedule
-  gen_lr_list: [0.001, 0.0001, 0.00001, 0.000005, 0.000001]
-  gen_lr_lims: [    2,      10,      20,      40,      100]
+  gen_lr_list: [0.001, 0.001]
+  gen_lr_lims: [    0,   100]
   # Number of scenes to be used in training
   number_of_scenes: 16000
   # Whether or not pick the scenes at random
-  randomize_scenes: True
-  # Frames to be read from a given scene
-  frames_per_scene: 1
+  randomize_scenes: False
+  # Frames to be read from a given scene (-1 means all)
+  frames_per_scene: -1
   # Whether or not pick the frames inside a given scene at random
-  randomize_frames: True
+  randomize_frames: False
   # Epochs to train, an epoch is a complete iteration over the "number_of_scenes", 
   # computing "frames_per_scene"x"number_of_scenes" samples.
   epochs_train: 100
-  # Whether or not use teacher forcing during train
-  use_teacher_force: True
-  # Teacher force list and limits conforming a teacher force modulation schedule
-  teacher_force_list: [1.0, 0.5, 0.25, 0.0, 0.0, 0.0, 0.0]
-  teacher_force_lims: [  2,    5,   7,   10,  15,  30, 100]
-  # Whether or not initialize the decoder recurrent layer using the history paths (Not working in graph mode)
-  init_decoder_on_history: True
   
-  # Future steps to train on and limits conforming a the training schedule
-  future_steps_train_list: [50, 25, 15, 10, 5]
-  future_steps_train_lims: [20, 30, 40, 90, 100]
   # Whether or not modulate the future steps to train on, if false, the maximum is used (future_num_frames)
   use_modulate_future_steps: False
 

@@ -14,6 +14,7 @@ import tensorflow.keras as keras
 import tensorflow.keras.backend as K
 
 from l5kit.evaluation import metrics
+from l5kit.configs import load_config_data
 
 
 
@@ -60,8 +61,20 @@ def tf_neg_multi_log_likelihood(
 
 @tf.function
 def L_loss_single2mult(objPath, predPAth, availPoints):
+    """
+    Uses "tf_neg_multi_log_likelihood" to compute the likelihood of a batch
+    of samples.
+
+    Args:
+        objPath (np.ndarray): Objective/Real path
+        predPAth (np.ndarray): Estimated path.
+        availPoints (np.ndarray): Availability of each datapoint (boolean)
+    Returns:
+        out_L (np.ndarray): Likelihood for each path
+    """
 
     out_L = list()
+    # Process each sample in batch
     for idx_batch in range(objPath.shape[0]):
         valLikelihood = tf_neg_multi_log_likelihood(objPath[idx_batch,:,:2],
                                                                     tf.expand_dims(predPAth[idx_batch,:,:2], axis=0),
@@ -79,17 +92,17 @@ def L_loss_single2mult(objPath, predPAth, availPoints):
 
 @tf.function
 def L2_loss(objPath, predPAth, availPoints):
-    '''
+    """
     Calculate the mean L2 loss of the prediction.
 
-    Arguments:
-    objPath --- Real path.
-    predPAth --- Predicted path.
-    availPoints --- Number valid real points.
+    Args:
+        objPath (np.ndarray): Real path.
+        predPAth (np.ndarray): Predicted path.
+        availPoints (np.ndarray): Number valid real points.
 
-    Outputs:
-    out_loss --- Mean L2 loss.
-    '''
+    Returns:
+        out_loss (np.ndarray): Mean L2 loss.
+    """
 
     # Mask with availability
     predPAth = tf.multiply(predPAth, tf.tile(tf.expand_dims(availPoints,axis=-1), [1,1,predPAth.shape[-1]]))
@@ -105,41 +118,58 @@ def L2_loss(objPath, predPAth, availPoints):
 
 
 def tf_diff_along_step(a):
+    """
+    Calculates the numerical derivate of the input tensor.
+    Only works on path tensors of shape [batch, steps, coords]
 
+    Args:
+        a (tf.tensor): input vehicle path.
+    Returns:
+        diff (tf.tensor): Derivate of "s", shape [batch, steps-1, coords]
+    """
+    # Shift and substract the tensor agaisnt itself
     diff = (tf.roll(a, shift=1, axis=1) - a)
-
+    # Return all but first sample
     return diff[:,1:,:]
 
-def get_velocity_and_acceleration(batch_hist_pos):
+def get_velocity_and_acceleration(batch_pos):
+    """
+    Calculates the velocity and acceleration of a batch of vehicles.
 
+    Args:
+        batch_pos (tf.tensor): Batch of positions, shqpe [batch, steps, coords]
+    Returns:
+        v (tf.tensor): Velocity of each vehicle.
+        a (tf.tensor): Acceleration of each vehicle.
+        confidence (tf.tensor): Confidence of calculation based on the deviation of the mean.
+    """
 
-    v_inst = tf_diff_along_step(batch_hist_pos)
+    # Get first derivate
+    v_inst = tf_diff_along_step(batch_pos)
+    # Get the velocity as the mean of the first derivate
     v = tf.reduce_mean(v_inst, axis = 1)
+    # Calculate the deviation of the mean for the velocity
     std_v = tf.math.reduce_std(v_inst, axis = 1)
-    v_mean_norm_conf = tf.divide((std_v/tf.sqrt(tf.cast(batch_hist_pos.shape[1], dtype=tf.float32))),v)
+    v_mean_norm_conf = tf.divide((std_v/tf.sqrt(tf.cast(batch_pos.shape[1], dtype=tf.float32))),v)
     v_mean_norm_conf = tf.abs(v_mean_norm_conf)
 
-    a_inst = tf_diff_along_step(tf_diff_along_step(batch_hist_pos))
+    # Get second derivate
+    a_inst = tf_diff_along_step(v_inst)
+    # Get the acceleration as the mean of the second derivate
     a = tf.reduce_mean(a_inst, axis = 1)
+    # Calculate the deviation of the mean for the acceleration
     std_a = tf.math.reduce_std(a_inst, axis = 1)
-    a_mean_norm_conf = tf.divide((std_a/tf.sqrt(tf.cast(batch_hist_pos.shape[1], dtype=tf.float32))),a)
+    a_mean_norm_conf = tf.divide((std_a/tf.sqrt(tf.cast(batch_pos.shape[1], dtype=tf.float32))),a)
     a_mean_norm_conf = tf.abs(a_mean_norm_conf)
 
-    confidence = 1.0-tf.clip_by_value(v_mean_norm_conf*a_mean_norm_conf, 0.0, 1.0)#tf.multiply(v_mean_norm_conf,a_mean_norm_conf)
+    # Build a confidence tensor
+    confidence = 1.0-tf.clip_by_value(v_mean_norm_conf*a_mean_norm_conf, 0.0, 1.0)
 
     return v, a, confidence
 
 ###############################################################################
 # ------------------------ CUSTOM TRAIN FUNCTIONS --------------------------- #
 ###############################################################################
-
-def get_mean_and_std_norm(tensor_list):
-    grad_norm_list = list()
-    [grad_norm_list.append(tf.norm(grad)) for grad in tensor_list]
-    grad_norm_list = tf.convert_to_tensor(grad_norm_list)
-
-    return  tf.reduce_mean(grad_norm_list), tf.math.reduce_std(grad_norm_list)
-
 
 @tf.function
 def generator_train_step_Base(img_t, target_path, TargetAvail, ImageEncModel, PathDecModel,
@@ -149,6 +179,25 @@ def generator_train_step_Base(img_t, target_path, TargetAvail, ImageEncModel, Pa
                              loss_use = [L2_loss],
                              loss_couplings = [1],
                              gradient_clip_value = 10.0):
+    """
+    Train step function of the lyft base model.
+
+    Args:
+        img_t (tf.tensor / np.array): Tensor with input map batch, multi channel image shape: [batch, x, y, ch].
+        target_path (tf.tensor / np.array): Tensor with objective path, shape: [batch, steps, coords].
+        TargetAvail (tf.tensor / np.array): Tensor with objective path availability (boolean), shape: [batch, steps, coords].
+        ImageEncModel (keras.model): Keras model for image encoding.
+        PathDecModel (keras.model): Keras model for path decoding/generation.
+        optimizer_gen (keras.optimizer): Keras optimizer... for training...
+        gen_loss (keras.metric): Keras metric placeholder, not a real use for this...
+        forwardpass_use (tf.function): Function which receives the inputs and applies the models.
+        loss_use (list): List of losses to apply, defaults to L2.
+        loss_couplings (list): Couplings of the losses, this list must have the same length as "loss_use" and be filled with floats.
+        gradient_clip_value (np.float): Maximum allowed gradient norm.
+    Returns:
+        gen_step_loss_list (list): List of loss tensors of this train step.
+        out_grad (list): List of gradients of this train step.
+    """
 
     stepsInfer = PathDecModel.output.shape[1]
 
@@ -181,11 +230,10 @@ def generator_train_step_Base(img_t, target_path, TargetAvail, ImageEncModel, Pa
 
         # We now clip the recursive models
         if image_model_trainable:
-        #     grad_gen_img = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_img]
             grad_gen_img, _ = tf.clip_by_global_norm(grad_gen_img, gradient_clip_value)
-
         grad_gen_dec, _ = tf.clip_by_global_norm(grad_gen_dec, gradient_clip_value)
 
+        # Get trainable weights
         train_vars = list()
         if image_model_trainable:
             train_vars += ImageEncModel.trainable_variables
@@ -203,11 +251,6 @@ def generator_train_step_Base(img_t, target_path, TargetAvail, ImageEncModel, Pa
     if image_model_trainable:
         out_grad.append(grad_gen_img)
     out_grad.append(grad_gen_dec)
-
-
-
-
-
 
     # Save loss
     gen_loss(tf.reduce_mean(gen_step_loss))
@@ -232,31 +275,42 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
                          stop_gradient_on_prediction = False,
                          increment_net = False,
                          mruv_guiding = False,
-                         mruv_weight = 0.1,
                          mruv_model = None,
                          mruv_model_trainable = False):
+    """
+    Train step function of the recurrent models (V1 and V2).
 
-    '''
-    Calculate the mean L2 loss of the prediction.
+    Args:
+        img_t (tf.tensor / np.array): Tensor with input map batch, multi channel image shape: [batch, x, y, ch].
+        hist_t (tf.tensor / np.array): Path history tensor with shape: [batch, hist_steps, coords].
+        target_path (tf.tensor / np.array): Tensor with objective path, shape: [batch, steps, coords].
+        HistAvail  (tf.tensor / np.array): Tensor with history path availability (boolean), shape: [batch, steps, coords].
+        TargetAvail (tf.tensor / np.array): Tensor with objective path availability (boolean), shape: [batch, steps, coords].
+        ImageEncModel (keras.model): Keras model for image encoding.
+        HistEncModel  (keras.model): Keras model for history path encoding.
+        PathDecModel (keras.model): Keras model for path decoding/generation.
+        optimizer_gen (keras.optimizer): Keras optimizer... for training...
+        gen_loss (keras.metric): Keras metric placeholder, not a real use for this...
+        initial_hidden_state (np.ndarray): Initial state of the path decoder RNN (used only in V1).
+        forwardpass_use (tf.function): Function which receives the inputs and applies the models.
+        loss_use (list): List of losses to apply, defaults to L2.
+        loss_couplings (list): Couplings of the losses, this list must have the same length as "loss_use" and be filled with floats.
+        stepsInfer (np.int): Number of future steps to predict.
+        use_teacher_force (np.bool): Whether or not use teacher force during training.
+        teacher_force_weight (np.float): How much does the teacher force modifies the RNN output.
+        gradient_clip_value (np.float): Maximum allowed gradient norm.
+        gradient_clip_thorugh_time_value (np.float): Value of the gradient clipping during the backward pass, not used because it is not supported in a tf.function, the clip value must be fixed.
+        stop_gradient_on_prediction (np.bool): Whether or not stop the gradient from flowing back through the RNN steps.
+        increment_net (np.bool): If this is an increment net the RNN only predicts the step length, not the absolute positions.
+        mruv_guiding (np.bool): If true a model is used to calculate the speed and acceleration of the vehicle and infer the future steps using accelerated linear movement. This is fed to the network as an additional input.
+        mruv_model (keras.model / function): A model or a function which generates the speed and acceleration for the batch.
+        mruv_model_trainable (np.boolean): If the mruv_model is trainable we must get gradients out of it.
 
-    Arguments:
-    img_t --- Multi-channel map input tensor.
-    hist_t --- Path history tensor.
-    target_path --- Target/Real path.
-    HistAvail --- Number valid history points.
-    TargetAvail --- Number valid target/real points.
-    ImageEncModel --- Model used to encode the input image (img_t)
-    HistEncModel --- Model used to encode the input history (hist_t)
-    PathDecModel --- Model used to produce the requested predictions.
-    optimizer_gen --- Keras optimizer object.
-    gen_loss --- Keras metric object.
-    initial_hidden_state --- Initial hidden state of the decoder model.
-    forwardpass_use --- forward pas of the model.
-    loss_use --- loss to be computed.
-    stepsInfer --- number of future steps to infer.
-    use_teacher_force --- Use a linear interpolation of the target path and the last predicted path.
-    teacher_force_weight --- Fraction of the target path used in the linear interpolation between target and predicted.
-    '''
+    Returns:
+        gen_step_loss_list (list): List of loss tensors of this train step.
+        out_grad (list): List of gradients of this train step.
+    """
+
 
     # Get number of steps to generate
     # if not tf.is_tensor(stepsInfer):
@@ -279,11 +333,10 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
                                         training_state = True,
                                         increment_net = increment_net,
                                         mruv_guiding = mruv_guiding,
-                                        mruv_weight = mruv_weight,
                                         mruv_model = mruv_model,
                                         mruv_model_trainable = mruv_model_trainable)
 
-
+            # If the forward pass uses mruv guiding more outputs are expected
             if mruv_guiding:
                 thisPath = outputs_fpass[0]
                 thisV = outputs_fpass[1]
@@ -302,7 +355,9 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
                 gen_step_loss_list.append(loss_act)
                 gen_step_loss += k_coup*loss_act
 
+            # Get loss of the mruv guiding network
             if mruv_guiding and mruv_model_trainable:
+                # Calculate speed and acceleration using the derivate of the history
                 targetV, targetA, _ = get_velocity_and_acceleration(hist_t)
                 lossV = tf.reduce_mean((thisV - targetV)**2, axis = -1)
                 gen_step_loss_list.append(lossV)
@@ -314,18 +369,17 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
                 # Compute MSE between mruv and target
                 mruv_L2 = tf.reduce_mean((mruv_path[:,1:stepsInfer+1,:] - target_path[:,:stepsInfer,:])**2, axis = 1)
                 # mruv_confidence = tf.exp(mruv_L2)
-                mruv_confidence = mruv_L2/tf.norm(target_path[:,:stepsInfer,:], axis = 1)
+                mruv_confidence = (mruv_L2/tf.norm(target_path[:,:stepsInfer,:], axis = 1))/500.0
+                mruv_confidence = tf.clip_by_value(mruv_confidence, 0.0, 2.0)
                 # Get confidence Loss
-                lossConf = tf.reduce_sum((thisConf - mruv_confidence)**2, axis = -1)
+                lossConf = tf.reduce_sum((thisConf - mruv_confidence)**2, axis = -1)*0.001
                 gen_step_loss_list.append(lossConf)
 
-                # lossConf = 0.0
-
-                mruv_loss = lossV+lossA+(lossConf*0.00001)
-
+                # Final mruv model loss
+                mruv_loss = lossV+lossA+lossConf
 
 
-
+    # Compute the gradient
     with tf.name_scope("Gradient_calc"):
         # Gradient wrt ImageEncModel
         image_model_trainable =  len(ImageEncModel.trainable_variables)>0
@@ -346,23 +400,12 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
         # Delete persistent gradient
         del gen_tape
 
-        # We now clip the recursive models
+        # We now clip the recursive models, the global norm!
         if image_model_trainable:
-        #     grad_gen_img = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_img]
             grad_gen_img, _ = tf.clip_by_global_norm(grad_gen_img, gradient_clip_value)
-        # grad_gen_hist = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_hist]
-        # grad_gen_dec = [(tf.clip_by_norm(grad, gradient_clip_value)) for grad in grad_gen_dec]
         grad_gen_hist, _ = tf.clip_by_global_norm(grad_gen_hist, gradient_clip_value)
         grad_gen_dec, _ = tf.clip_by_global_norm(grad_gen_dec, gradient_clip_value)
-        # grad_gen_hist = [tf.clip_by_value(grad,
-        #                                    clip_value_min=-gradient_clip_value,
-        #                                    clip_value_max=gradient_clip_value)
-        #                   for grad in grad_gen_hist]
-        # grad_gen_dec = [tf.clip_by_value(grad,
-        #                                    clip_value_min=-gradient_clip_value,
-        #                                    clip_value_max=gradient_clip_value)
-        #                   for grad in grad_gen_dec]
-        #
+        
         # Get full list of trainable variables and gradients
         train_vars = list()
         if image_model_trainable:
@@ -393,11 +436,6 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
     if mruv_guiding and mruv_model_trainable:
         out_grad.append(grad_mruv)
 
-
-
-
-
-
     # Save loss
     gen_loss(tf.reduce_mean(gen_step_loss))
 
@@ -405,19 +443,18 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
 
 
 def get_teacher_force_weight(tf_list, tf_lims, epoch, tf_weight_act, linearize=False):
-    '''
+    """
     Get the teacher force weight given the epoch and the weight planning.
 
-    Arguments:
-    tf_list --- List of teacher force weights.
-    tf_lims --- List of teacher force limit epochs for each weight.
-    epoch --- Current train epoch.
-    tf_weight_act --- Current teacher force weight.
-    linearize --- Linearize the teacher force weight between the given points.
-
-    Outputs:
-    tf_weight_new --- New teacher force weight.
-    '''
+    Args:
+        tf_list (list): List of teacher force weights.
+        tf_lims (list): List of teacher force limit epochs for each weight.
+        epoch (np.int32): Current train epoch.
+        tf_weight_act (np.float32): Current teacher force weight.
+        linearize (np.bool): Linearize the teacher force weight between the given points.
+    Returns:
+        tf_weight_new (np.flaot32): New teacher force weight.
+    """
 
     # Get current weight
     tf_lims = np.array(tf_lims)
@@ -435,15 +472,17 @@ def get_teacher_force_weight(tf_list, tf_lims, epoch, tf_weight_act, linearize=F
 
 
 def update_lr(lr_list, lr_lims, epoch, optimizer):
-    '''
+    """
     Set the learning rate given the epoch and the learning rate planning.
 
-    Arguments:
-    lr_list --- List of learning rates.
-    lr_lims --- List of learning rate limit epochs.
-    epoch --- Current train epoch.
-    optimizer --- Keras optimizer.
-    '''
+    Args:
+        lr_list (list): List of learning rates.
+        lr_lims (list): List of learning rate limit epochs.
+        epoch (np.int32): Current train epoch.
+        optimizer (keras.optimizer): Keras optimizer.
+    Returns:
+        lr_new (np.float32): New learning rate.
+    """
 
     # Get new learning rate
     lr_new = lr_list[np.squeeze(np.argwhere(np.array(lr_lims) >= epoch)[0])]
@@ -456,18 +495,17 @@ def update_lr(lr_list, lr_lims, epoch, optimizer):
 
 
 def get_future_steps_train(fs_list, fs_lims, epoch, fs_act):
-    '''
+    """
     Get the number of future steps to train on given the epoch and the planning.
 
-    Arguments:
-    fs_list --- List of future steps.
-    fs_lims --- List of limit epochs.
-    epoch --- Current train epoch.
-    fs_act --- Current future steps weight.
-
-    Outputs:
-    fs_new --- New future steps to train on.
-    '''
+    Args:
+        fs_list (list): List of future steps.
+        fs_lims (list): List of limit epochs.
+        epoch (np.int32): Current train epoch.
+        fs_act (np.float32): Current future steps weight.
+    Returns:
+        fs_new (np.int32) New future steps to train on.
+    """
 
     # Get current weight
     fs_lims = np.array(fs_lims)
@@ -487,21 +525,31 @@ def get_future_steps_train(fs_list, fs_lims, epoch, fs_act):
 
 def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecModel, forwardpass_use,
                    steps_validate = None, all_metrics = False, stepsInfer = -1, base_model = False,
-                   mruv_guiding = False, mruv_weight = 0.1, mruv_model = None, mruv_model_trainable = False, increment_net = False):
-    '''
+                   mruv_guiding = False, mruv_model = None, mruv_model_trainable = False, increment_net = False):
+    """
     Validate the generator model using the validation dataset.
 
-    Arguments:
-    tf_validation_dataset --- TensorFlow Dataset object of the validation dataset.
-    ImageEncModel --- Model used to encode the input image.
-    HistEncModel --- Model used to encode the input history.
-    PathDecModel --- Model used to produce the requested predictions.
-    steps_validate --- Number of steps to perform validation on (None means all).
+    Args:
+        tf_validation_dataset (tf.Dataset): TensorFlow Dataset object of the validation dataset.
+        ImageEncModel (keras.Model): Model used to encode the input image.
+        HistEncModel (keras.Model): Model used to encode the input history.
+        PathDecModel (keras.Model): Model used to produce the requested predictions.
+        forwardpass_use (tf.function): Function which receives the inputs and applies the models.
+        steps_validate (np.int32): Number of steps to perform validation on (None means all).
+        all_metrics (np.bool): Use all metrics or only L2.
+        stepsInfer (np.bool): Number of future steps to validate on, -1 means all of the available in the dataset.
+        base_model (np.bool): Whether or not the model is the lyft baseline.
+        mruv_guiding (np.bool): Whether or not speed and acceleration estimation is being used.
+        mruv_model (keras.model / function): Function or model used to estimate speed and acceleration.
+        mruv_model_trainable (np.bool): If true, the mruv_model is a keras.model, otherwise it is a function.
+        increment_net (np.bool): Whether or not the model is an increment RNN.
+    Returns:
+        mean_L2_loss (np.float) Mean L2 validation loss.
+        mean_Likelihood_loss (np.float) Mean likelihood validation loss. (if all_metrics == True)
+        mean_TD_loss (np.ndarray) Mean Time Displace validation loss. (if all_metrics == True)
+    """
 
-    Outputs:
-    out_loss --- Mean L2 validation loss.
-    '''
-
+    # Setup
     idx_val = 0
     valLoss_acum = 0
 
@@ -510,17 +558,19 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
 
     gen_batch_size = PathDecModel.inputs[0].shape[0]
 
-
+    # Iterate over the validation dataset
     custom_steps = True
     val_dataset_prog_bar = tqdm(tf_validation_dataset, total=steps_validate)
     for (valSampleMapComp, valSampeHistPath, valSampeTargetPath,
              valHistAvail, valTargetAvail,
              valTimeStamp, valTrackID, valRasterFromAgent, valWorldFromAgent, valCentroid, valIDX) in val_dataset_prog_bar:
 
+        # If the batch size of this minibatch is smaller than the expected stop (RNN models have fixed batchsize due to being statefull)
         if gen_batch_size != None:
             if valSampleMapComp.shape[0] < gen_batch_size:
                 break
-
+            
+        # Get number of steps to infer if not defined
         if stepsInfer == -1:
             custom_steps = False
             stepsInfer = valSampeTargetPath.shape[-2]
@@ -538,7 +588,6 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
                                                     use_teacher_force=False,
                                                     increment_net = increment_net,
                                                     mruv_guiding = mruv_guiding,
-                                                    mruv_weight = mruv_weight,
                                                     mruv_model = mruv_model,
                                                     mruv_model_trainable = mruv_model_trainable)
 
@@ -566,7 +615,6 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
         valLikelihood_acum += np.mean(L_loss_single2mult(valSampeTargetPath[:,:stepsInfer,:], valPredPath, valTargetAvail[:,:stepsInfer]))
 
 
-
         # Update progress bar
         if all_metrics:
             msg_string = 'Validation: L2 = %.2f ; L = %.2f ; TD(T) = %0.2f '%( (valLoss_acum/(idx_val+1)),
@@ -580,7 +628,7 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
 
         val_dataset_prog_bar.set_description(msg_string)
 
-
+        # Update steps
         idx_val += 1
         if steps_validate != None:
             if idx_val > steps_validate:
@@ -604,14 +652,14 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
 ###############################################################################
 
 def meta_dict_pass(dataset, **kwargs):
-    '''
+    """
     Dataset wrapper for TensorFlow Data compatibility
 
     Yields the dataset without any order
 
-    Arguments:
-    dataset --- Agent dataset from Lyft library
-    '''
+    Args:
+        dataset (AgentDataset): Agent dataset from Lyft library
+    """
 
     for sample_index, frame in enumerate(dataset):
         frame['sample_idx'] = sample_index
@@ -624,18 +672,20 @@ def meta_dict_gen(dataset,
                   frames_per_scene = 1,
                   yield_only_large_distances = False,
                   min_max_dist = 25.0):
-    '''
+    """
     Dataset generator wrapper for TensorFlow Data compatibility
 
     Yields a fixed number of scenes and frames
 
-    Arguments:
-    dataset --- Agent dataset from Lyft library
-    randomize_frame --- Frames are yield in random order
-    randomize_scene --- Scenes are yield in random order
-    num_scenes --- Total number of scenes to be yield in one epoch
-    frames_per_scene --- Number of frames to yield per scene (-1 means all)
-    '''
+    Args:
+        dataset (AgentDataset): Agent dataset from Lyft library
+        randomize_frame (np.bool): Frames are yield in random order
+        randomize_scene (np.bool): Scenes are yield in random order
+        num_scenes (np.bool): Total number of scenes to be yield in one epoch
+        frames_per_scene (np.bool): Number of frames to yield per scene (-1 means all)
+        yield_only_large_distances (np.bool): Yield only samples with a given minimum maximum displacement.
+        min_max_dist (np.float32): Minimum maximum displacement to use.
+    """
 
     # Save the requested number of frames per scene
     requested_frames_per_scene = frames_per_scene
@@ -690,23 +740,24 @@ def get_tf_dataset(dataset,
                    num_scenes=-1,
                    frames_per_scene = -1,
                    meta_dict_use = meta_dict_gen):
-    '''
+    """
     Creates a TensorFlow dict dataset from a Lyft dataset generator.
 
-    Arguments:
-    dataset --- Agent dataset from Lyft library
-    num_hist_frames --- Number of history points in a frame
-    map_input_shape --- Shape of the map image.
-    num_future_frames --- Number of frames to be predicted.
-    randomize_frame --- Frames are yield in random order
-    randomize_scene --- Scenes are yield in random order
-    num_scenes --- Total number of scenes to be yield in one epoch
-    frames_per_scene --- Number of frames to yield per scene (-1 means all)
+    Args:
+        dataset (AgentDataset): Agent dataset from Lyft library
+        num_hist_frames (np.int32): Number of history points in a frame
+        map_input_shape (np.ndarray): Shape of the map image.
+        num_future_frames (np.int32): Number of frames to be predicted.
+        randomize_frame (np.bool): Frames are yield in random order
+        randomize_scene (np.bool): Scenes are yield in random order
+        num_scenes (np.int32): Total number of scenes to be yield in one epoch
+        frames_per_scene (np.int32): Number of frames to yield per scene (-1 means all)
+        meta_dict_use (function): Dictionary read function to be used, defaults to "meta_dict_gen".
+    Returns:
+        tf_dataset (tf.Dataset): TensorFlow Dataset object.
+    """
 
-    Outputs:
-    tf_dataset --- TensorFlow Dataset object.
-    '''
-
+    # Get number of scenes to use
     if num_scenes < 1:
         num_scenes = len(dataset.dataset.scenes)
     if num_scenes > len(dataset.dataset.scenes):
@@ -715,7 +766,7 @@ def get_tf_dataset(dataset,
 
     print('Creating dataset with: \n\t Randomized scenes: %r\n\t Randomized frames: %r\n\t Number of scenes: %d\n\t Number of frames per scenes: %d'%(randomize_frame, randomize_scene, num_scenes, frames_per_scene))
 
-
+    # Create dict dataset and return
     return tf.data.Dataset.from_generator(lambda: meta_dict_use(dataset,
                                                                 randomize_frame=randomize_frame,
                                                                 randomize_scene=randomize_scene,
@@ -762,17 +813,16 @@ def get_tf_dataset(dataset,
 
 
 def create_fade_image(input_multiCh_image, fade_factor = 0.75, update_threshold = 0.1):
-    '''
+    """
     Create an image with previous history layers faded in.
 
-    Arguments:
-    input_multiCh_image --- Ego or Agent map with channel size equal to number of history frames
-    fade_factor --- Intensity fade of the history frames.
-    update_threshold --- Minimum image activity to be kept.
-
-    Outputs:
-    imgFade --- Ego or Agent map with faded history frames.
-    '''
+    Args:
+        input_multiCh_image (np.ndarray): Ego or Agent map with channel size equal to number of history frames
+        fade_factor (np.float32): Intensity fade of the history frames.
+        update_threshold (np.float32): Minimum image activity to be kept.
+    Returns:
+        imgFade (np.ndarray): Ego or Agent map with faded history frames.
+    """
     # Get last step image and mask
     imgFade = input_multiCh_image[0,:,:]
     sample_mask = 1.0-tf.cast((imgFade>update_threshold),tf.float32)
@@ -793,25 +843,27 @@ def create_fade_image(input_multiCh_image, fade_factor = 0.75, update_threshold 
 
 # Sample conformation functions (tf and numpy)
 def tf_get_input_sample(datasetSample, image_preprocess_fcn = lambda x: x, use_fading = True, use_angle = True):
-    '''
+    """
     Tensorflow sample mapping function.
 
     Takes a frame and pre-process its information, resulting in selected data to
     be used in the model.
 
-    Arguments:
-    datasetSample --- Sample tensor (dict).
-
-    Outputs:
-    sampleMapComp --- Multi-channel image with the RGB map and the faded Ego and Agents
-    sampleHistPath --- Tensor of history [num_hist_frames x coordinates]
-    sampleTargetPath --- Target tensor [num_objective_frames x coordinates]
-    histAvail --- Bool tensor of history availability [num_hist_frames]
-    targetAvail --- Bool tensor of target availability [num_objective_frames]
-    timeStamp --- Time stamp of the sample
-    trackID --- Track ID of the agent
-    thisRasterFromAgent --- Raster from Agent conversion matrix.
-    '''
+    Args:
+        datasetSample (dict) Sample tensors.
+    Returns:
+        sampleMapComp (tf.tensor): Multi-channel image with the RGB map and the faded Ego and Agents
+        sampleHistPath (tf.tensor): Tensor of history [num_hist_frames x coordinates]
+        sampleTargetPath (tf.tensor): Target tensor [num_objective_frames x coordinates]
+        histAvail (tf.tensor): Bool tensor of history availability [num_hist_frames]
+        targetAvail (tf.tensor): Bool tensor of target availability [num_objective_frames]
+        timeStamp (tf.tensor): Time stamp of the sample
+        trackID (tf.tensor): Track ID of the agent
+        thisRasterFromAgent (tf.tensor): Raster from Agent conversion matrix.
+        thisWorldFromAgent (tf.tensor): World from Agent conversion matrix.
+        thisCentroid (tf.tensor): Agent centroid.
+        thisSampleIdx (tf.tensor): Sample index.
+    """
 
     # Get number of history frames
     num_hist_frames = datasetSample['history_positions'].shape[0]
@@ -884,11 +936,6 @@ def tf_get_input_sample(datasetSample, image_preprocess_fcn = lambda x: x, use_f
     # Availability
     histAvail = datasetSample['history_availabilities']
     targetAvail = datasetSample['target_availabilities']
-#     histAvail = datasetSample['history_availabilities']
-#     targetAvail = datasetSample['target_yaws']!=0.0
-#     targetAvail = tf.squeeze(targetAvail)
-    # targetAvail_mask = tf.cast(tf.concat([[1],tf.zeros(targetAvail.shape[0]-1)], axis=0), dtype=tf.bool) # Force at least one sample to true (this fails, and I dont trust the dataset availability...)
-    # targetAvail = tf.cast(tf.logical_or(targetAvail, targetAvail_mask), dtype=np.float32)
 
     # Data
     timeStamp = datasetSample['timestamp']
@@ -907,16 +954,39 @@ def tf_get_input_sample(datasetSample, image_preprocess_fcn = lambda x: x, use_f
 # ------------------------ TF MODEL LOAD/SAVE ------------------------------- #
 ###############################################################################
 
+def fill_defaults(cfg):
+    """
+    Loads the default values of the config.
+
+    Args:
+        cfg (dict): Read parameters.
+    Returns:
+        cfg (dict): Full parameter dict with defaults if some category is not defined.
+    """
+
+    base_cfg = load_config_data(os.path.join(os.path.split(os.path.realpath(__file__))[0], 'default_config.yaml'))
+
+    
+    for key_1 in base_cfg:
+        try:
+            for key_2 in base_cfg[key_1]:
+                if not (key_2 in cfg[key_1]):
+                    cfg[key_1][key_2] = base_cfg[key_1][key_2]
+        except:
+            pass
+
+    return cfg
+
 
 def save_model(model_save, save_path, save_name, use_keras=True):
     """
     Save model using Keras API (single .h5 file) OR a HDF5 for weights and JSON for model.
 
-    Arguments:
-    model_save --- Keras model to save
-    save_path --- Output folder
-    save_name --- Name of the h5 file to be written
-    use_keras --- Use keras API to save, else use JSON + HDF5
+    Args:
+        model_save (keras.model): Keras model to save
+        save_path (string): Output folder
+        save_name (string): Name of the h5 file to be written
+        use_keras (np.bool): Use keras API to save, else use JSON + HDF5
     """
     if not os.path.exists(save_path):
         os.makedirs(save_path)
@@ -937,16 +1007,14 @@ def load_model(load_path, load_name, use_keras=True, custom_obj_dict=[]):
     """
     Load model using Keras API (single .h5 file) OR from a HDF5 file for weights and a JSON file for model
 
-    Arguments:
-    load_path --- Model save folder
-    load_name --- Name of the h5 file to be read
-    use_keras --- Use keras API to save, else use JSON + HDF5
-    custom_obj_dict --- Dictionary of custom objects for keras API (i.e. custom layers)
-
-    Outputs:
-    model --- TensorFlow Keras model.
+    Args:
+        load_path (string): Model save folder
+        load_name (string): Name of the h5 file to be read
+        use_keras (np.bool): Use keras API to save, else use JSON + HDF5
+        custom_obj_dict (dict): Dictionary of custom objects for keras API (i.e. custom layers)
+    Returns:
+        model (keras.model): TensorFlow Keras model.
     """
-
 
     if use_keras:
         loaded_model = keras.models.load_model(os.path.join(load_path,load_name+".h5"), custom_objects=custom_obj_dict)
@@ -966,15 +1034,14 @@ def load_model(load_path, load_name, use_keras=True, custom_obj_dict=[]):
 
 
 def save_optimizer_state(optimizer, save_path, save_name):
-    '''
+    """
     Save keras.optimizers object state.
 
-    Arguments:
-    optimizer --- Optimizer object.
-    save_path --- Path to save location.
-    save_name --- Name of the .npy file to be created.
-
-    '''
+    Args:
+        optimizer (keras.optimizer): Optimizer object.
+        save_path (string): Path to save location.
+        save_name (string): Name of the .npy file to be created.
+    """
 
     # Create folder if it does not exists
     if not os.path.exists(save_path):
@@ -986,16 +1053,15 @@ def save_optimizer_state(optimizer, save_path, save_name):
     return
 
 def load_optimizer_state(load_path, load_name, optimizer, model_train_vars):
-    '''
+    """
     Loads keras.optimizers object state.
 
-    Arguments:
-    load_path --- Path to save location.
-    load_name --- Name of the .npy file to be read.
-    optimizer --- Optimizer object to be loaded.
-    model_train_vars --- List of model variables (obtained using Model.trainable_variables)
-
-    '''
+    Args:
+        load_path (string): Path to save location.
+        load_name (string): Name of the .npy file to be read.
+        optimizer (keras.optimizer): Optimizer object to be loaded.
+        model_train_vars (list): List of model variables (obtained using Model.trainable_variables)
+    """
 
     # Load optimizer weights
     opt_weights = np.load(os.path.join(load_path, load_name)+'.npy', allow_pickle=True)
