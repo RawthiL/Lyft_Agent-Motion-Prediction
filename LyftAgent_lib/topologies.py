@@ -420,7 +420,7 @@ def pathDecoderModel_Baseline(cfg, ImageEncModel):
                                     activation = path_decode_fc_activation,
                                     name='pathOutHid_%d'%idx_decode_layer)(featOutT)
     # Last output
-    pathOut = keras.layers.Dense(future_num_frames*3,
+    pathOut = keras.layers.Dense(future_num_frames*num_outs,
                                 activation = None,
                                 name='pathOutLinear')(featOutT)
 

@@ -276,7 +276,8 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
                          increment_net = False,
                          mruv_guiding = False,
                          mruv_model = None,
-                         mruv_model_trainable = False):
+                         mruv_model_trainable = False,
+                         mruv_to_diff = True):
     """
     Train step function of the recurrent models (V1 and V2).
 
@@ -357,26 +358,46 @@ def generator_train_step(img_t, hist_t, target_path, HistAvail, TargetAvail,
 
             # Get loss of the mruv guiding network
             if mruv_guiding and mruv_model_trainable:
-                # Calculate speed and acceleration using the derivate of the history
-                targetV, targetA, _ = get_velocity_and_acceleration(hist_t)
-                lossV = tf.reduce_mean((thisV - targetV)**2, axis = -1)
-                gen_step_loss_list.append(lossV)
-                lossA = tf.reduce_mean((thisA - targetA)**2, axis = -1)
-                gen_step_loss_list.append(lossA)
+                if mruv_to_diff:
+                    # Calculate speed and acceleration using the derivate of the history
+                    targetV, targetA, _ = get_velocity_and_acceleration(hist_t)
+                    lossV = tf.reduce_mean((thisV - targetV)**2, axis = -1)
+                    gen_step_loss_list.append(lossV)
+                    lossA = tf.reduce_mean((thisA - targetA)**2, axis = -1)
+                    gen_step_loss_list.append(lossA)
 
-                # Get expected mruv path
-                mruv_path = lyl_nn.compute_mruv_path(targetV, targetA, stepsInfer)
-                # Compute MSE between mruv and target
-                mruv_L2 = tf.reduce_mean((mruv_path[:,1:stepsInfer+1,:] - target_path[:,:stepsInfer,:])**2, axis = 1)
-                # mruv_confidence = tf.exp(mruv_L2)
-                mruv_confidence = (mruv_L2/tf.norm(target_path[:,:stepsInfer,:], axis = 1))/500.0
-                mruv_confidence = tf.clip_by_value(mruv_confidence, 0.0, 2.0)
-                # Get confidence Loss
-                lossConf = tf.reduce_sum((thisConf - mruv_confidence)**2, axis = -1)*0.001
-                gen_step_loss_list.append(lossConf)
+                    # Get expected mruv path
+                    mruv_path = lyl_nn.compute_mruv_path(targetV, targetA, stepsInfer)
+                    # Compute MSE between mruv and target
+                    mruv_L2 = tf.reduce_mean((mruv_path[:,1:stepsInfer+1,:] - target_path[:,:stepsInfer,:])**2, axis = 1)
+                    # mruv_confidence = tf.exp(mruv_L2)
+                    mruv_confidence = (mruv_L2/tf.norm(target_path[:,:stepsInfer,:], axis = 1))/500.0
+                    mruv_confidence = tf.clip_by_value(mruv_confidence, 0.0, 2.0)
+                    # Get confidence Loss
+                    lossConf = tf.reduce_sum((thisConf - mruv_confidence)**2, axis = -1)*0.001
+                    gen_step_loss_list.append(lossConf)
 
-                # Final mruv model loss
-                mruv_loss = lossV+lossA+lossConf
+                    # Final mruv model loss
+                    mruv_loss = lossV+lossA+lossConf
+                else:
+                    # Get expected mruv path
+                    mruv_path = lyl_nn.compute_mruv_path(thisV, thisA, stepsInfer)
+                    # Calculate TD(T)
+                    mruv_error = tf.reduce_sum(((target_path[:,stepsInfer,:] - mruv_path[:,stepsInfer,:]) * TargetAvail[:,stepsInfer]) ** 2, axis=-1)
+                    # V and A have the same error now
+                    gen_step_loss_list.append(mruv_error)
+                    gen_step_loss_list.append(mruv_error)
+
+                    # Get confidence Loss
+                    mruv_confidence = mruv_error
+                    mruv_confidence = tf.clip_by_value(mruv_confidence, 0.0, 2.0)
+                    lossConf = tf.reduce_sum((thisConf - mruv_confidence)**2, axis = -1)*0.001
+                    gen_step_loss_list.append(lossConf)
+
+                    # Final mruv model loss
+                    mruv_loss = mruv_confidence+lossConf
+
+
 
 
     # Compute the gradient
@@ -577,9 +598,7 @@ def validate_model(tf_validation_dataset, ImageEncModel, HistEncModel, PathDecMo
 
         # Predict
         if base_model:
-            valPredPath = forwardpass_use(valSampleMapComp,
-                                                    ImageEncModel,  PathDecModel,
-                                                    use_teacher_force=False)
+            valPredPath = forwardpass_use(valSampleMapComp, ImageEncModel,  PathDecModel)
         else:
             PathDecModel.reset_states()
             HistEncModel.reset_states()
@@ -671,7 +690,7 @@ def meta_dict_gen(dataset,
                   num_scenes=16000,
                   frames_per_scene = 1,
                   yield_only_large_distances = False,
-                  min_max_dist = 25.0):
+                  min_max_dist = 5.0):
     """
     Dataset generator wrapper for TensorFlow Data compatibility
 
@@ -721,8 +740,8 @@ def meta_dict_gen(dataset,
 
             # Filter samples with low maximum displacement if requested
             if yield_only_large_distances:
-                dist_max = np.sqrt(sample_out['target_positions'][np.sum(sample_out['target_availabilities']),0]**2\
-                                  +sample_out['target_positions'][np.sum(sample_out['target_availabilities']),1]**2)
+                dist_max = tf.sqrt(sample_out['target_positions'][tf.cast(tf.reduce_sum(sample_out['target_availabilities']), tf.int32)-1,0]**2\
+                                  +sample_out['target_positions'][tf.cast(tf.reduce_sum(sample_out['target_availabilities']), tf.int32)-1,1]**2)
                 if dist_max < min_max_dist:
                     continue
 
@@ -739,7 +758,9 @@ def get_tf_dataset(dataset,
                    randomize_scene=False,
                    num_scenes=-1,
                    frames_per_scene = -1,
-                   meta_dict_use = meta_dict_gen):
+                   meta_dict_use = meta_dict_gen,
+                   yield_only_large_distances = False,
+                   min_max_dist = 5.0):
     """
     Creates a TensorFlow dict dataset from a Lyft dataset generator.
 
@@ -765,13 +786,17 @@ def get_tf_dataset(dataset,
         num_scenes = len(dataset.dataset.scenes)
 
     print('Creating dataset with: \n\t Randomized scenes: %r\n\t Randomized frames: %r\n\t Number of scenes: %d\n\t Number of frames per scenes: %d'%(randomize_frame, randomize_scene, num_scenes, frames_per_scene))
+    if yield_only_large_distances:
+        print('Dataset will only yield paths with maximum distances larger than %0.2f'%min_max_dist)
 
     # Create dict dataset and return
     return tf.data.Dataset.from_generator(lambda: meta_dict_use(dataset,
                                                                 randomize_frame=randomize_frame,
                                                                 randomize_scene=randomize_scene,
                                                                 num_scenes=num_scenes,
-                                                                frames_per_scene=frames_per_scene),
+                                                                frames_per_scene=frames_per_scene,
+                                                                yield_only_large_distances = yield_only_large_distances,
+                                                                min_max_dist = min_max_dist),
                                           output_types={'image': tf.float32,
                                                         'target_positions': tf.float32,
                                                         'target_yaws': tf.float32,
@@ -1082,3 +1107,31 @@ def load_optimizer_state(load_path, load_name, optimizer, model_train_vars):
 
 
     return
+
+
+def load_models(load_path, load_name, load_img_model=False, isBaseModel=False, mruv_guiding = False, mruv_model_trainable = False):
+    custom_layers_dict = {'BahdanauAttention': lyl_nn.BahdanauAttention, 'LeakyReLU': keras.layers.LeakyReLU}
+
+    if load_img_model:
+        ImageEncModel = load_model(os.path.join(load_path, 'ImageEncModel'), load_name, use_keras=True,  custom_obj_dict=custom_layers_dict)
+    else:
+        ImageEncModel = load_model(os.path.join(load_path, 'ImageEncModel'), 'all_epochs', use_keras=True, custom_obj_dict=custom_layers_dict)
+
+    if not isBaseModel:
+        HistEncModel = load_model(os.path.join(load_path, 'HistEncModel'), load_name, use_keras=True, custom_obj_dict=custom_layers_dict)
+    else:
+        HistEncModel = None
+
+    if mruv_guiding:
+        if mruv_model_trainable:
+            mruv_model  = load_model(os.path.join(load_path, 'mruvModel'), load_name, use_keras=True, custom_obj_dict=custom_layers_dict)
+        else:
+            mruv_model  = get_velocity_and_acceleration
+    else:
+        mruv_model = None
+
+    PathDecModel = load_model(os.path.join(load_path, 'PathDecModel'), load_name, use_keras=True, custom_obj_dict=custom_layers_dict)
+
+    print('All models succesfully loaded.')
+
+    return ImageEncModel, HistEncModel, PathDecModel, mruv_model

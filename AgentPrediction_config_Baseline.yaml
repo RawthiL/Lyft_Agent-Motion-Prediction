@@ -16,8 +16,10 @@ model_params:
 
   # Base model for image feature extraction 
   # Note: Each model has its own preprocessing function, please select the right one...
-  base_image_model: "ResNet50"
-  base_image_preprocess: "resnet.preprocess_input"
+  # base_image_model: "ResNet50"
+  # base_image_preprocess: "resnet.preprocess_input"
+  base_image_model: "MobileNetV2"
+  base_image_preprocess: "mobilenet_v2.preprocess_input"
 
   
   # Number of fully connected layers used to generate the output coordinates (not counting last)
@@ -50,8 +52,8 @@ model_params:
 training_params: 
 
   # Learning rate list and epochs conforming a learning rate schedule
-  gen_lr_list: [0.001, 0.0001, 0.00001, 0.000005, 0.000001]
-  gen_lr_lims: [    2,      10,      20,      40,      100]
+  gen_lr_list: [0.001, 0.0001, 0.00001, 0.00001]
+  gen_lr_lims: [    2,      10,      20,   1000]
   # Number of scenes to be used in training
   number_of_scenes: 16000
   # Whether or not pick the scenes at random
@@ -62,21 +64,8 @@ training_params:
   randomize_frames: True
   # Epochs to train, an epoch is a complete iteration over the "number_of_scenes", 
   # computing "frames_per_scene"x"number_of_scenes" samples.
-  epochs_train: 100
-  # Whether or not use teacher forcing during train
-  use_teacher_force: True
-  # Teacher force list and limits conforming a teacher force modulation schedule
-  teacher_force_list: [1.0, 0.5, 0.25, 0.0, 0.0, 0.0, 0.0]
-  teacher_force_lims: [  2,    5,   7,   10,  15,  30, 100]
-  # Whether or not initialize the decoder recurrent layer using the history paths (Not working in graph mode)
-  init_decoder_on_history: True
+  epochs_train: 1000
   
-  # Future steps to train on and limits conforming a the training schedule
-  future_steps_train_list: [50, 25, 15, 10, 5]
-  future_steps_train_lims: [20, 30, 40, 90, 100]
-  # Whether or not modulate the future steps to train on, if false, the maximum is used (future_num_frames)
-  use_modulate_future_steps: True
-
   # Whether or not retrain input layer of image processing model
   retrain_inputs_image_model: True
   # Whether or not retrain the whole image processing model
